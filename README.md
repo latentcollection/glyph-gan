@@ -1,6 +1,7 @@
 # GylphGAN
 
-Deep convolutional GAN trained on glyphs
+Deep convolutional GAN trained on glyphs. Original deep convolutional generative adverserial network by [Ritchie Vink](https://www.ritchievink.com/blog/2018/07/16/generative-adversarial-networks-in-pytorch-the-distribution-of-art/), adapted by [
+Aleksi Halttunen](https://github.com/aleksihalt/DCGAN_interpolation).
 
 ![Thumbnail](./thumbnail.png)
 
