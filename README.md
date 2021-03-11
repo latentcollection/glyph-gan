@@ -1,6 +1,6 @@
 # GylphGAN
 
-Pytorch based deep convolutional GAN trained on glyphs. Original architecture by [Ritchie Vink](https://www.ritchievink.com/blog/2018/07/16/generative-adversarial-networks-in-pytorch-the-distribution-of-art/), adapted by [
+Pytorch based deep convolutional GAN trained on glyphs. Based on the original architecture by [Ritchie Vink](https://www.ritchievink.com/blog/2018/07/16/generative-adversarial-networks-in-pytorch-the-distribution-of-art/), adapted by [
 Aleksi Halttunen](https://github.com/aleksihalt/DCGAN_interpolation), and implemented by [Moritz Salla](https://github.com/moritzsalla).
 
 ![Thumbnail](./thumbnail.jpg)
