@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -96,6 +97,23 @@ def _write_video(frames: list[np.ndarray], out: str | Path, fps: int) -> Path:
 # --- models --------------------------------------------------------------------
 
 
+def _init_weights(module: nn.Module) -> None:
+    """DCGAN draws conv and batchnorm weights from N(0, 0.02).
+
+    PyTorch defaults to Kaiming-uniform, a different distribution entirely. The
+    paper's choice is load-bearing rather than incidental: DCGAN is unstable at
+    other initialisations, and the reference implementation applies this.
+    """
+    name = type(module).__name__
+    if "Conv" in name or "Linear" in name:
+        nn.init.normal_(module.weight, 0.0, 0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif "BatchNorm" in name:
+        nn.init.normal_(module.weight, 1.0, 0.02)
+        nn.init.zeros_(module.bias)
+
+
 def _stages(size: int, channels: int = DEFAULT_CHANNELS) -> list[int]:
     """Feature count at each 2x stage, halving down from `channels`."""
     if size < BASE * 2 or size & (size - 1):
@@ -110,44 +128,60 @@ class Generator(nn.Module):
         size: int = 64,
         latent: int = LATENT,
         channels: int = DEFAULT_CHANNELS,
-        alpha: float = 0.2,
     ):
         super().__init__()
         ch = _stages(size, channels)
         self.input = nn.Linear(latent, BASE * BASE * ch[0])
 
-        layers: list[nn.Module] = [nn.BatchNorm2d(ch[0]), nn.LeakyReLU(alpha)]
+        # ReLU throughout the generator and Tanh at the output, per the paper.
+        # LeakyReLU is the discriminator's activation, not the generator's.
+        layers: list[nn.Module] = [nn.BatchNorm2d(ch[0]), nn.ReLU(True)]
         for i, c in enumerate(ch):
             out = ch[i + 1] if i + 1 < len(ch) else 1
             layers.append(nn.ConvTranspose2d(c, out, 4, 2, 1))
             if out == 1:
                 layers.append(nn.Tanh())
             else:
-                layers += [nn.BatchNorm2d(out), nn.LeakyReLU(alpha)]
+                layers += [nn.BatchNorm2d(out), nn.ReLU(True)]
         self.net = nn.Sequential(*layers)
         self.ch0 = ch[0]
+        self.apply(_init_weights)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(self.input(z).view(-1, self.ch0, BASE, BASE))
 
 
 class Discriminator(nn.Module):
-    def __init__(self, size: int = 64, channels: int = DEFAULT_CHANNELS, alpha: float = 0.2):
+    def __init__(
+        self,
+        size: int = 64,
+        channels: int = DEFAULT_CHANNELS,
+        alpha: float = 0.2,
+        spectral: bool = False,
+    ):
         super().__init__()
         ch = list(reversed(_stages(size, channels)))
+
+        # Spectral normalisation constrains each layer's Lipschitz constant and
+        # replaces batchnorm rather than joining it - batchnorm couples samples
+        # within a batch, which at batch 32 makes the discriminator's statistics
+        # noisy and lets information leak between real and fake.
+        norm = spectral_norm if spectral else (lambda m: m)
 
         layers: list[nn.Module] = []
         prev = 1
         for i, c in enumerate(ch):
-            layers.append(nn.Conv2d(prev, c, 4, 2, 1))
+            layers.append(norm(nn.Conv2d(prev, c, 4, 2, 1)))
             # No norm on the first layer; it would wash out the input statistics.
-            if i:
+            if i and not spectral:
                 layers.append(nn.BatchNorm2d(c))
             layers.append(nn.LeakyReLU(alpha))
             prev = c
         self.net = nn.Sequential(*layers)
-        self.output = nn.Linear(BASE * BASE * prev, 1)
+        self.output = norm(nn.Linear(BASE * BASE * prev, 1))
         self.flat = BASE * BASE * prev
+        if not spectral:
+            self.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.output(self.net(x).reshape(-1, self.flat))
@@ -454,6 +488,7 @@ def train(
     betas: tuple[float, float] = (0.5, 0.999),
     channels: int = DEFAULT_CHANNELS,
     augment: bool = True,
+    spectral: bool = False,
     ckpt_dir: str | Path = "checkpoints",
     save_every_steps: int = 2000,
     preview_every: int | None = None,
@@ -480,10 +515,8 @@ def train(
         num_workers = 2 if device.type == "cuda" else 0
 
     loader = make_loader(img_dir, size=size, batch_size=batch_size, num_workers=num_workers)
-    gen, dis = (
-        Generator(size, channels=channels).to(device),
-        Discriminator(size, channels=channels).to(device),
-    )
+    gen = Generator(size, channels=channels).to(device)
+    dis = Discriminator(size, channels=channels, spectral=spectral).to(device)
     opt_g = torch.optim.Adam(gen.parameters(), lr, betas=betas)
     opt_d = torch.optim.Adam(dis.parameters(), lr, betas=betas)
 
