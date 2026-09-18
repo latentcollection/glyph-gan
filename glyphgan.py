@@ -114,21 +114,65 @@ def _soft_labels(shape, device, flip_rate=0.03, smooth=0.1):
     return torch.where(flip, fake, real), torch.where(flip, real, fake)
 
 
-def train_step(gen, dis, opt_g, opt_d, real, device):
+def _brightness(x):
+    return x + (torch.rand(x.size(0), 1, 1, 1, device=x.device) - 0.5)
+
+
+def _contrast(x):
+    m = x.mean(dim=(1, 2, 3), keepdim=True)
+    return (x - m) * (torch.rand(x.size(0), 1, 1, 1, device=x.device) + 0.5) + m
+
+
+def _translate(x, ratio=0.125):
+    n, _, h, w = x.shape
+    pad = max(1, int(h * ratio + 0.5))
+    p = F.pad(x, (pad, pad, pad, pad))
+    oy = torch.randint(0, 2 * pad + 1, (n,))
+    ox = torch.randint(0, 2 * pad + 1, (n,))
+    return torch.stack([p[i, :, oy[i]:oy[i] + h, ox[i]:ox[i] + w] for i in range(n)])
+
+
+def _cutout(x, ratio=0.5):
+    n, _, h, w = x.shape
+    ch, cw = int(h * ratio + 0.5) // 2, int(w * ratio + 0.5) // 2
+    cy = torch.randint(0, h, (n,))
+    cx = torch.randint(0, w, (n,))
+    mask = torch.ones_like(x)
+    for i in range(n):
+        mask[i, :, max(0, cy[i] - ch):cy[i] + ch, max(0, cx[i] - cw):cx[i] + cw] = 0
+    return x * mask
+
+
+def diff_augment(x):
+    """Differentiable augmentation applied to real and fake alike.
+
+    With only a few thousand glyphs the discriminator memorises the set and
+    stops handing the generator a useful gradient. Augmenting both sides with
+    operations gradients can flow through widens the effective dataset without
+    teaching the generator to reproduce the augmentations themselves.
+
+    Saturation, part of the usual policy, is omitted: these are single-channel
+    images, so it is a no-op.
+    """
+    return _cutout(_translate(_contrast(_brightness(x))))
+
+
+def train_step(gen, dis, opt_g, opt_d, real, device, augment=False):
     real = real.to(device)
     batch = real.size(0)
+    aug = diff_augment if augment else (lambda t: t)
 
     opt_d.zero_grad(set_to_none=True)
-    pred_real = dis(real)
+    pred_real = dis(aug(real))
     y_real, y_fake = _soft_labels(pred_real.shape, device)
     fake = gen(torch.randn(batch, LATENT, device=device))
     loss_d = (F.binary_cross_entropy_with_logits(pred_real, y_real)
-              + F.binary_cross_entropy_with_logits(dis(fake.detach()), y_fake))
+              + F.binary_cross_entropy_with_logits(dis(aug(fake.detach())), y_fake))
     loss_d.backward()
     opt_d.step()
 
     opt_g.zero_grad(set_to_none=True)
-    pred_fake = dis(fake)
+    pred_fake = dis(aug(fake))
     loss_g = F.binary_cross_entropy_with_logits(pred_fake, torch.ones_like(pred_fake))
     loss_g.backward()
     opt_g.step()
@@ -252,8 +296,8 @@ def latest_checkpoint(ckpt_dir):
 
 
 def train(img_dir, size=64, epochs=50, batch_size=32, lr=2e-4, betas=(0.5, 0.999),
-          width=MAX_CH, ckpt_dir="checkpoints", save_every=5, resume=True,
-          device=None, num_workers=None, log_every=20):
+          width=MAX_CH, augment=True, ckpt_dir="checkpoints", save_every=5,
+          resume=True, device=None, num_workers=None, log_every=20):
     """Train to `epochs`, checkpointing as it goes.
 
     Every exit path writes a checkpoint, including Ctrl-C and a crash, because
@@ -292,7 +336,7 @@ def train(img_dir, size=64, epochs=50, batch_size=32, lr=2e-4, betas=(0.5, 0.999
     try:
         for epoch in range(start, epochs):
             for i, (x, _) in enumerate(loader, 1):
-                loss_d, loss_g = train_step(gen, dis, opt_g, opt_d, x, device)
+                loss_d, loss_g = train_step(gen, dis, opt_g, opt_d, x, device, augment)
                 if i % log_every == 0 or i == n:
                     print(f"epoch {epoch:3d}  {i:4d}/{n}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
             if save_every and (epoch + 1) % save_every == 0:

@@ -51,6 +51,14 @@ def check_labels_uniform():
     assert rate.max() < 0.08, f"flips not uniform across the batch: {rate.tolist()}"
 
 
+def check_augment():
+    x = (torch.rand(4, 1, 64, 64) * 1.8 - 0.9).requires_grad_(True)
+    y = gg.diff_augment(x)
+    assert y.shape == x.shape, y.shape
+    y.sum().backward()
+    assert x.grad.abs().sum() > 0, "augment must be differentiable"
+
+
 def check_checkpoint_roundtrip(tmp):
     gen, dis = gg.Generator(64, width=256), gg.Discriminator(64, width=256)
     og = torch.optim.Adam(gen.parameters(), 2e-4)
@@ -66,7 +74,7 @@ if __name__ == "__main__":
 
     tmp = Path(tempfile.mkdtemp())
     for fn in (check_shapes, check_width, check_train_step, check_slerp_norm,
-               check_labels_uniform):
+               check_labels_uniform, check_augment):
         fn()
         print(f"ok  {fn.__name__}")
     check_checkpoint_roundtrip(tmp)
