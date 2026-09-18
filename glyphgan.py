@@ -347,6 +347,25 @@ def latest_checkpoint(ckpt_dir):
     return found[-1] if found else None
 
 
+def save_preview(path, gen, n=8, seed=0, device=None):
+    """Contact sheet of `n` samples, for watching a run progress."""
+    import numpy as np
+    from PIL import Image
+
+    device = device or pick_device()
+    g = torch.Generator().manual_seed(seed)
+    z = torch.randn(n, LATENT, generator=g).to(device)
+    was_training = gen.training
+    gen.eval()
+    with torch.no_grad():
+        sheet = np.hstack([to_image(v) for v in gen(z)])
+    gen.train(was_training)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(sheet).save(path)
+    return path
+
+
 def train(
     img_dir,
     size=64,
@@ -359,6 +378,7 @@ def train(
     augment=True,
     ckpt_dir="checkpoints",
     save_every_steps=2000,
+    preview_every=None,
     resume=True,
     device=None,
     num_workers=None,
@@ -421,6 +441,11 @@ def train(
                 step += 1
                 if step % log_every == 0:
                     print(f"step {step:6d}/{max_steps}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
+                if preview_every and step % preview_every == 0:
+                    # Preview the averaged weights, since that is what renders.
+                    shadow = Generator(size, width=width).to(device)
+                    shadow.load_state_dict(ema.state_dict())
+                    save_preview(Path(ckpt_dir) / f"preview{step:07d}.png", shadow, device=device)
                 if save_every_steps and step % save_every_steps == 0:
                     save_checkpoint(
                         Path(ckpt_dir) / f"step{step:07d}.pt",
@@ -453,3 +478,93 @@ def train(
         print(f"saved {path} at step {step}")
 
     return gen, dis
+
+
+def _extent(mask):
+    """Length of the True-span along dim 1, per row."""
+    idx = torch.arange(mask.size(1), device=mask.device)
+    lo = torch.where(mask, idx, torch.full_like(idx, mask.size(1))).min(dim=1).values
+    hi = torch.where(mask, idx, torch.full_like(idx, -1)).max(dim=1).values
+    return (hi - lo + 1).clamp(min=1).float()
+
+
+def measure_weight(x):
+    """Ink coverage - a proxy for typographic weight."""
+    return (x > 0).float().mean(dim=(1, 2, 3))
+
+
+def measure_aspect(x):
+    """Ink bounding-box width/height - a proxy for condensed vs extended."""
+    m = x > 0
+    return _extent(m.any(dim=2).squeeze(1)) / _extent(m.any(dim=3).squeeze(1))
+
+
+def find_direction(gen, measure, n=2048, batch=64, device=None, seed=0):
+    """Find the latent direction along which `measure` increases.
+
+    A GAN has no encoder, so a semantic axis cannot be read off the model
+    directly. Instead sample the latent space, measure the property on each
+    output, and least-squares regress the property against the latent: the
+    fitted coefficients point the way the property grows. Walking that vector
+    traverses one typographic axis deliberately, rather than drifting between
+    arbitrary points the way a random interpolation does.
+
+    Returns the unit direction and the correlation it achieves - a low
+    correlation means the model never learned that axis, usually because the
+    dataset normalised it away.
+    """
+    device = device or pick_device()
+    gen = gen.to(device).eval()
+    g = torch.Generator().manual_seed(seed)
+    zs, ys = [], []
+    with torch.no_grad():
+        for _ in range(0, n, batch):
+            z = torch.randn(batch, LATENT, generator=g).to(device)
+            zs.append(z.cpu())
+            ys.append(measure(gen(z)).cpu())
+    z = torch.cat(zs).double()
+    y = torch.cat(ys).double()
+
+    zc = z - z.mean(0)
+    yc = (y - y.mean()) / (y.std() + 1e-12)
+
+    # Fit on one half and score on the other. With LATENT (200) coefficients an
+    # in-sample fit is close to saturated at any sample count worth waiting for,
+    # and would report a confident correlation for a direction that is noise.
+    cut = len(zc) // 2
+    d = torch.linalg.lstsq(zc[:cut], yc[:cut].unsqueeze(1)).solution.squeeze(1)
+    d = d / d.norm()
+    pred = zc[cut:] @ d
+    held = yc[cut:]
+    corr = float(
+        ((pred - pred.mean()) * (held - held.mean())).mean() / (pred.std() * held.std() + 1e-12)
+    )
+    return d.float(), corr
+
+
+def render_axis(gen, direction, out, span=3.0, frames=60, fps=30, seed=0, device=None, base=None):
+    """Walk a single latent direction from -span to +span and write a video.
+
+    Everything except the chosen axis is held fixed, so the result reads as one
+    typeface being pushed along that axis rather than as a dissolve between two
+    unrelated letterforms.
+    """
+    import imageio.v2 as imageio
+
+    device = device or pick_device()
+    gen = gen.to(device).eval()
+    if base is None:
+        g = torch.Generator().manual_seed(seed)
+        base = torch.randn(1, LATENT, generator=g)
+    base = base.to(device)
+    d = direction.to(device).unsqueeze(0)
+
+    video = []
+    with torch.no_grad():
+        for i in range(frames):
+            t = -span + 2 * span * i / (frames - 1)
+            video.append(to_image(gen(base + t * d)[0]))
+    video = video + video[::-1]  # walk out and back so it loops
+    out = Path(out)
+    imageio.mimwrite(out, video, fps=fps)
+    return out
