@@ -10,15 +10,31 @@ e.g. the output of `fontscrape --glyphs a --size 64 --mode xheight`.
 from __future__ import annotations
 
 import math
-from collections.abc import Sized
+from collections.abc import Callable, Sized
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+
+
+class HasStateDict(Protocol):
+    """Anything whose weights can be written to a checkpoint.
+
+    Generator and EMA both qualify, which is what lets a run checkpoint the
+    averaged weights without the caller knowing which one it is holding.
+    """
+
+    def state_dict(self) -> dict: ...
+
+
+# A live generator, or a path to a checkpoint holding one.
+GeneratorSource = nn.Module | str | Path
+Measure = Callable[[torch.Tensor], torch.Tensor]
 
 LATENT = 200
 BASE = 4
@@ -98,7 +114,7 @@ class Discriminator(nn.Module):
         return self.output(self.net(x).reshape(-1, self.flat))
 
 
-class _Cached(torch.utils.data.Dataset):
+class _Cached(torch.utils.data.Dataset[tuple[torch.Tensor, int]]):
     """Decode the dataset once and keep it in memory.
 
     A glyph set is small - a few thousand 64px greyscale images is tens of MB -
@@ -107,17 +123,23 @@ class _Cached(torch.utils.data.Dataset):
     than by arithmetic.
     """
 
-    def __init__(self, base):
+    def __init__(self, base: datasets.ImageFolder) -> None:
         self.tensors = torch.stack([base[i][0] for i in range(len(base))])
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.tensors)
 
-    def __getitem__(self, i):
-        return self.tensors[i], 0
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        return self.tensors[index], 0
 
 
-def make_loader(img_dir, size=64, batch_size=64, num_workers=2, cache=True) -> DataLoader:
+def make_loader(
+    img_dir: str | Path,
+    size: int = 64,
+    batch_size: int = 64,
+    num_workers: int = 2,
+    cache: bool = True,
+) -> DataLoader:
     tf = transforms.Compose(
         [
             transforms.Grayscale(1),
@@ -135,7 +157,9 @@ def make_loader(img_dir, size=64, batch_size=64, num_workers=2, cache=True) -> D
     )
 
 
-def _soft_labels(shape, device, flip_rate=0.03, smooth=0.1):
+def _soft_labels(
+    shape: tuple, device: torch.device, flip_rate: float = 0.03, smooth: float = 0.1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Smoothed targets with a few labels swapped, per ganhacks.
 
     Both tricks slow the discriminator down so it cannot win outright early and
@@ -147,16 +171,16 @@ def _soft_labels(shape, device, flip_rate=0.03, smooth=0.1):
     return torch.where(flip, fake, real), torch.where(flip, real, fake)
 
 
-def _brightness(x):
+def _brightness(x: torch.Tensor) -> torch.Tensor:
     return x + (torch.rand(x.size(0), 1, 1, 1, device=x.device) - 0.5)
 
 
-def _contrast(x):
+def _contrast(x: torch.Tensor) -> torch.Tensor:
     m = x.mean(dim=(1, 2, 3), keepdim=True)
     return (x - m) * (torch.rand(x.size(0), 1, 1, 1, device=x.device) + 0.5) + m
 
 
-def _translate(x, ratio=0.125):
+def _translate(x: torch.Tensor, ratio: float = 0.125) -> torch.Tensor:
     """Random per-sample shift, vectorised.
 
     Uses gather-style indexing rather than grid_sample: MPS implements neither
@@ -176,7 +200,7 @@ def _translate(x, ratio=0.125):
     return p[b, :, ys, xs].permute(0, 3, 1, 2).contiguous()
 
 
-def _cutout(x, ratio=0.5):
+def _cutout(x: torch.Tensor, ratio: float = 0.5) -> torch.Tensor:
     n, _, h, w = x.shape
     ch, cw = int(h * ratio + 0.5) // 2, int(w * ratio + 0.5) // 2
     cy = torch.randint(0, h, (n, 1, 1), device=x.device)
@@ -187,7 +211,7 @@ def _cutout(x, ratio=0.5):
     return x * keep.unsqueeze(1).to(x.dtype)
 
 
-def diff_augment(x):
+def diff_augment(x: torch.Tensor) -> torch.Tensor:
     """Differentiable augmentation applied to real and fake alike.
 
     With only a few thousand glyphs the discriminator memorises the set and
@@ -201,7 +225,15 @@ def diff_augment(x):
     return _cutout(_translate(_contrast(_brightness(x))))
 
 
-def train_step(gen, dis, opt_g, opt_d, real, device, augment=False):
+def train_step(
+    gen: nn.Module,
+    dis: nn.Module,
+    opt_g: torch.optim.Optimizer,
+    opt_d: torch.optim.Optimizer,
+    real: torch.Tensor,
+    device: torch.device,
+    augment: bool = False,
+) -> tuple[float, float]:
     real = real.to(device)
     batch = real.size(0)
     aug = diff_augment if augment else (lambda t: t)
@@ -246,7 +278,7 @@ class EMA:
         self._other = [k for k in sd if k not in set(self._float)]
 
     @torch.no_grad()
-    def update(self, model):
+    def update(self, model: nn.Module) -> None:
         self.step += 1
         d = min(self.decay, (1 + self.step) / (10 + self.step))
         cur = model.state_dict()
@@ -257,7 +289,7 @@ class EMA:
         for k in self._other:
             self.shadow[k] = cur[k].detach().clone()
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
         return {k: v.clone() for k, v in self.shadow.items()}
 
 
@@ -277,13 +309,13 @@ def slerp(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
     return (torch.sin((1.0 - t) * omega) / sin_omega) * a + (torch.sin(t * omega) / sin_omega) * b
 
 
-def to_image(x: torch.Tensor):
+def to_image(x: torch.Tensor) -> np.ndarray:
     """Single generator output to an 8-bit grayscale frame."""
     x = x.detach().float().clamp(-TARGET_SCALE, TARGET_SCALE) / TARGET_SCALE
     return ((x + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).squeeze().cpu().numpy()
 
 
-def load_generator(checkpoint, device=None):
+def load_generator(checkpoint: str | Path, device: torch.device | None = None) -> nn.Module:
     device = device or pick_device()
     blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
     gen = Generator(
@@ -324,13 +356,13 @@ def render_interpolation(
 
     video = []
     with torch.no_grad():
-        for a, b in zip(keys, keys[1:]):
+        for a, b in zip(keys, keys[1:], strict=False):
             for k in range(frames):
                 video.append(to_image(gen(slerp(a, b, k / frames))[0]))
 
     out = Path(out)
     try:
-        imageio.mimwrite(out, video, fps=fps)
+        imageio.mimwrite(out, np.stack(video), fps=fps)
     except Exception as exc:
         raise RuntimeError(
             f"could not write {out}. mp4 output needs the ffmpeg plugin: pip install imageio-ffmpeg"
@@ -372,7 +404,9 @@ def save_checkpoint(
     return path
 
 
-def save_generator(path, gen, size, width=DEFAULT_WIDTH):
+def save_generator(
+    path: str | Path, gen: HasStateDict, size: int, width: int = DEFAULT_WIDTH
+) -> Path:
     """`gen` may be a Generator or an EMA wrapper - both expose state_dict()."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,7 +414,7 @@ def save_generator(path, gen, size, width=DEFAULT_WIDTH):
     return path
 
 
-def latest_checkpoint(ckpt_dir):
+def latest_checkpoint(ckpt_dir: str | Path) -> Path | None:
     found = sorted(Path(ckpt_dir).glob("step*.pt"), key=lambda p: p.stat().st_mtime)
     return found[-1] if found else None
 
@@ -518,7 +552,7 @@ def train(
     return gen, dis
 
 
-def _extent(mask):
+def _extent(mask: torch.Tensor) -> torch.Tensor:
     """Length of the True-span along dim 1, per row."""
     idx = torch.arange(mask.size(1), device=mask.device)
     lo = torch.where(mask, idx, torch.full_like(idx, mask.size(1))).min(dim=1).values
@@ -526,18 +560,25 @@ def _extent(mask):
     return (hi - lo + 1).clamp(min=1).float()
 
 
-def measure_weight(x):
+def measure_weight(x: torch.Tensor) -> torch.Tensor:
     """Ink coverage - a proxy for typographic weight."""
     return (x > 0).float().mean(dim=(1, 2, 3))
 
 
-def measure_aspect(x):
+def measure_aspect(x: torch.Tensor) -> torch.Tensor:
     """Ink bounding-box width/height - a proxy for condensed vs extended."""
     m = x > 0
     return _extent(m.any(dim=2).squeeze(1)) / _extent(m.any(dim=3).squeeze(1))
 
 
-def find_direction(gen, measure, n=2048, batch=64, device=None, seed=0):
+def find_direction(
+    gen: nn.Module,
+    measure: Measure,
+    n: int = 2048,
+    batch: int = 64,
+    device: torch.device | None = None,
+    seed: int = 0,
+) -> tuple[torch.Tensor, float]:
     """Find the latent direction along which `measure` increases.
 
     A GAN has no encoder, so a semantic axis cannot be read off the model
@@ -604,5 +645,5 @@ def render_axis(gen, direction, out, span=3.0, frames=60, fps=30, seed=0, device
             video.append(to_image(gen(base + t * d)[0]))
     video = video + video[::-1]  # walk out and back so it loops
     out = Path(out)
-    imageio.mimwrite(out, video, fps=fps)
+    imageio.mimwrite(out, np.stack(video), fps=fps)
     return out
