@@ -46,11 +46,11 @@ Then either run the notebook, or drive the module directly:
 ```python
 import glyphgan as gg
 
-gg.train("dataset/", size=64, epochs=50, batch_size=32)
+gg.train("dataset/", size=64, max_steps=20000, batch_size=32)
 gg.render_interpolation("checkpoints/generator.pt", "render.mp4", keys=8, frames=60)
 ```
 
-Training checkpoints to `checkpoints/` every few epochs and on exit, including
+Training checkpoints to `checkpoints/` every few thousand steps and on exit, including
 Ctrl-C, and resumes from the latest checkpoint automatically. Rendering reads a
 checkpoint from disk and needs nothing from the training session, so a video can
 be made at any point from any run.
@@ -61,7 +61,7 @@ be made at any point from any run.
 |---|---|---|
 | `size` | `64` | output resolution; a power of two. Layer count follows it |
 | `width` | `256` | channels at the 4×4 stage, halving outward |
-| `epochs` | `50` | |
+| `max_steps` | `20000` | optimiser steps; the real training budget |
 | `batch_size` | `32` | |
 | `lr` | `2e-4` | from the DCGAN paper |
 | `betas` | `(0.5, 0.999)` | likewise |
@@ -85,6 +85,15 @@ mp4 that travels through a sequence of latent waypoints and loops back to the
 first. Interpolation is spherical rather than linear — a straight line between
 two Gaussian latents passes through norms the model never saw during training,
 which makes morphs sag and wash out halfway.
+
+## Why DCGAN
+
+A GAN latent space is natively smooth and walkable, which is what a morph video
+needs; diffusion models make better single images but worse interpolations.
+StyleGAN2-ADA would be the stronger choice for this data regime, but NVIDIA
+licenses it for "research or evaluation purposes only", which does not cover
+published artwork. DiffAugment (BSD-2) gets most of the small-data benefit
+without that constraint, and is built in.
 
 ## Credits
 

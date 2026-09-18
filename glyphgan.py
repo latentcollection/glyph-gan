@@ -281,7 +281,7 @@ def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=DEFAULT_WID
     # Full checkpoints carry both models and both Adam states, so they run to
     # a few hundred MB each. Keep only the most recent few.
     if keep_last:
-        stale = sorted(path.parent.glob("epoch*.pt"), key=lambda p: p.stat().st_mtime)
+        stale = sorted(path.parent.glob("step*.pt"), key=lambda p: p.stat().st_mtime)
         for old in stale[:-keep_last]:
             old.unlink()
     return path
@@ -296,14 +296,21 @@ def save_generator(path, gen, size, width=DEFAULT_WIDTH):
 
 
 def latest_checkpoint(ckpt_dir):
-    found = sorted(Path(ckpt_dir).glob("epoch*.pt"), key=lambda p: p.stat().st_mtime)
+    found = sorted(Path(ckpt_dir).glob("step*.pt"), key=lambda p: p.stat().st_mtime)
     return found[-1] if found else None
 
 
-def train(img_dir, size=64, epochs=50, batch_size=32, lr=2e-4, betas=(0.5, 0.999),
-          width=DEFAULT_WIDTH, augment=True, ckpt_dir="checkpoints", save_every=5,
-          resume=True, device=None, num_workers=None, log_every=20):
-    """Train to `epochs`, checkpointing as it goes.
+def train(img_dir, size=64, max_steps=20000, epochs=None, batch_size=32, lr=2e-4,
+          betas=(0.5, 0.999), width=DEFAULT_WIDTH, augment=True,
+          ckpt_dir="checkpoints", save_every_steps=2000, resume=True, device=None,
+          num_workers=None, log_every=100):
+    """Train for `max_steps` optimiser steps, checkpointing as it goes.
+
+    The budget is in steps rather than epochs on purpose. A few hundred glyphs
+    make an epoch only a handful of steps, so an epoch count borrowed from a
+    large dataset trains for almost no time - 50 epochs of 272 images is 400
+    steps, against the tens of thousands a GAN needs. Pass `epochs` instead only
+    when you specifically want a pass count.
 
     Every exit path writes a checkpoint, including Ctrl-C and a crash, because
     an unsaved generator is a run you cannot render a video from.
@@ -328,30 +335,36 @@ def train(img_dir, size=64, epochs=50, batch_size=32, lr=2e-4, betas=(0.5, 0.999
             dis.load_state_dict(blob["dis"])
             opt_g.load_state_dict(blob["opt_g"])
             opt_d.load_state_dict(blob["opt_d"])
-            start = blob["epoch"] + 1
-            print(f"resumed {found.name} at epoch {start}")
+            start = blob["epoch"]
+            print(f"resumed {found.name} at step {start}")
 
     n = len(loader)
+    if epochs is not None:
+        max_steps = epochs * n
     params = sum(p.numel() for p in gen.parameters()) + sum(p.numel() for p in dis.parameters())
     print(f"{device.type} | {size}px | width {width} | {params/1e6:.1f}M params | "
           f"batch {batch_size} | {len(loader.dataset)} images | {n} steps/epoch | "
-          f"epochs {start}-{epochs - 1}")
+          f"{max_steps} steps")
 
-    epoch = start
+    step, epoch = start, start // max(n, 1)
     try:
-        for epoch in range(start, epochs):
-            for i, (x, _) in enumerate(loader, 1):
+        while step < max_steps:
+            for x, _ in loader:
                 loss_d, loss_g = train_step(gen, dis, opt_g, opt_d, x, device, augment)
-                if i % log_every == 0 or i == n:
-                    print(f"epoch {epoch:3d}  {i:4d}/{n}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
-            if save_every and (epoch + 1) % save_every == 0:
-                save_checkpoint(Path(ckpt_dir) / f"epoch{epoch:04d}.pt",
-                                gen, dis, opt_g, opt_d, epoch, size, width)
+                step += 1
+                if step % log_every == 0:
+                    print(f"step {step:6d}/{max_steps}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
+                if save_every_steps and step % save_every_steps == 0:
+                    save_checkpoint(Path(ckpt_dir) / f"step{step:07d}.pt",
+                                    gen, dis, opt_g, opt_d, step, size, width)
+                if step >= max_steps:
+                    break
+            epoch += 1
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
-        path = save_checkpoint(Path(ckpt_dir) / f"epoch{epoch:04d}.pt",
-                               gen, dis, opt_g, opt_d, epoch, size, width)
-        print(f"saved {path}")
+        path = save_checkpoint(Path(ckpt_dir) / f"step{step:07d}.pt",
+                               gen, dis, opt_g, opt_d, step, size, width)
+        print(f"saved {path} at step {step}")
 
     return gen, dis
