@@ -38,18 +38,19 @@ def pick_device() -> torch.device:
     return torch.device("cpu")
 
 
-def _stages(size: int) -> list[int]:
-    """Channel width at each 2x stage, halving down from MAX_CH."""
+def _stages(size: int, width: int = MAX_CH) -> list[int]:
+    """Channel width at each 2x stage, halving down from `width`."""
     if size < BASE * 2 or size & (size - 1):
         raise ValueError(f"size must be a power of two >= {BASE * 2}, got {size}")
     n = int(math.log2(size // BASE))
-    return [max(MAX_CH >> i, 32) for i in range(n)]
+    return [max(width >> i, 32) for i in range(n)]
 
 
 class Generator(nn.Module):
-    def __init__(self, size: int = 64, latent: int = LATENT, alpha: float = 0.2):
+    def __init__(self, size: int = 64, latent: int = LATENT, width: int = MAX_CH,
+                 alpha: float = 0.2):
         super().__init__()
-        ch = _stages(size)
+        ch = _stages(size, width)
         self.input = nn.Linear(latent, BASE * BASE * ch[0])
 
         layers: list[nn.Module] = [nn.BatchNorm2d(ch[0]), nn.LeakyReLU(alpha)]
@@ -68,9 +69,9 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, size: int = 64, alpha: float = 0.2):
+    def __init__(self, size: int = 64, width: int = MAX_CH, alpha: float = 0.2):
         super().__init__()
-        ch = list(reversed(_stages(size)))
+        ch = list(reversed(_stages(size, width)))
 
         layers: list[nn.Module] = []
         prev = 1
@@ -160,7 +161,8 @@ def to_image(x: torch.Tensor):
 def load_generator(checkpoint, device=None):
     device = device or pick_device()
     blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
-    gen = Generator(size=blob.get("size", 64), latent=blob.get("latent", LATENT))
+    gen = Generator(size=blob.get("size", 64), latent=blob.get("latent", LATENT),
+                    width=blob.get("width", MAX_CH))
     gen.load_state_dict(blob["gen"])
     return gen.to(device).eval()
 
@@ -206,3 +208,101 @@ def render_interpolation(generator, out, keys=8, frames=60, fps=30,
             "pip install imageio-ffmpeg"
         ) from exc
     return out
+
+
+def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=MAX_CH, keep_last=3):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "gen": gen.state_dict(),
+        "dis": dis.state_dict(),
+        "opt_g": opt_g.state_dict(),
+        "opt_d": opt_d.state_dict(),
+        "epoch": epoch,
+        "size": size,
+        "width": width,
+        "latent": LATENT,
+    }, path)
+
+    # Rendering needs the generator alone, so keep a light copy next to the
+    # full checkpoints - roughly a fifth the size, and the only file worth
+    # keeping once a run is finished.
+    save_generator(path.parent / "generator.pt", gen, size, width)
+
+    # Full checkpoints carry both models and both Adam states, so they run to
+    # a few hundred MB each. Keep only the most recent few.
+    if keep_last:
+        stale = sorted(path.parent.glob("epoch*.pt"), key=lambda p: p.stat().st_mtime)
+        for old in stale[:-keep_last]:
+            old.unlink()
+    return path
+
+
+def save_generator(path, gen, size, width=MAX_CH):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"gen": gen.state_dict(), "size": size, "width": width,
+                "latent": LATENT}, path)
+    return path
+
+
+def latest_checkpoint(ckpt_dir):
+    found = sorted(Path(ckpt_dir).glob("epoch*.pt"), key=lambda p: p.stat().st_mtime)
+    return found[-1] if found else None
+
+
+def train(img_dir, size=64, epochs=50, batch_size=32, lr=2e-4, betas=(0.5, 0.999),
+          width=MAX_CH, ckpt_dir="checkpoints", save_every=5, resume=True,
+          device=None, num_workers=None, log_every=20):
+    """Train to `epochs`, checkpointing as it goes.
+
+    Every exit path writes a checkpoint, including Ctrl-C and a crash, because
+    an unsaved generator is a run you cannot render a video from.
+    """
+    device = device or pick_device()
+    if num_workers is None:
+        # Worker processes spawn rather than fork off CUDA, and on macOS that
+        # deadlocks inside notebooks often enough not to be worth the speedup.
+        num_workers = 2 if device.type == "cuda" else 0
+
+    loader = make_loader(img_dir, size=size, batch_size=batch_size, num_workers=num_workers)
+    gen, dis = Generator(size, width=width).to(device), Discriminator(size, width=width).to(device)
+    opt_g = torch.optim.Adam(gen.parameters(), lr, betas=betas)
+    opt_d = torch.optim.Adam(dis.parameters(), lr, betas=betas)
+
+    start = 0
+    if resume:
+        found = latest_checkpoint(ckpt_dir)
+        if found:
+            blob = torch.load(found, map_location=device, weights_only=False)
+            gen.load_state_dict(blob["gen"])
+            dis.load_state_dict(blob["dis"])
+            opt_g.load_state_dict(blob["opt_g"])
+            opt_d.load_state_dict(blob["opt_d"])
+            start = blob["epoch"] + 1
+            print(f"resumed {found.name} at epoch {start}")
+
+    n = len(loader)
+    params = sum(p.numel() for p in gen.parameters()) + sum(p.numel() for p in dis.parameters())
+    print(f"{device.type} | {size}px | width {width} | {params/1e6:.1f}M params | "
+          f"batch {batch_size} | {len(loader.dataset)} images | {n} steps/epoch | "
+          f"epochs {start}-{epochs - 1}")
+
+    epoch = start
+    try:
+        for epoch in range(start, epochs):
+            for i, (x, _) in enumerate(loader, 1):
+                loss_d, loss_g = train_step(gen, dis, opt_g, opt_d, x, device)
+                if i % log_every == 0 or i == n:
+                    print(f"epoch {epoch:3d}  {i:4d}/{n}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
+            if save_every and (epoch + 1) % save_every == 0:
+                save_checkpoint(Path(ckpt_dir) / f"epoch{epoch:04d}.pt",
+                                gen, dis, opt_g, opt_d, epoch, size, width)
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+    finally:
+        path = save_checkpoint(Path(ckpt_dir) / f"epoch{epoch:04d}.pt",
+                               gen, dis, opt_g, opt_d, epoch, size, width)
+        print(f"saved {path}")
+
+    return gen, dis
