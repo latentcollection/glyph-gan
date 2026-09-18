@@ -60,7 +60,7 @@ be made at any point from any run.
 | | Default | |
 |---|---|---|
 | `size` | `64` | output resolution; a power of two. Layer count follows it |
-| `width` | `1024` | channels at the 4×4 stage, halving outward |
+| `width` | `256` | channels at the 4×4 stage, halving outward |
 | `epochs` | `50` | |
 | `batch_size` | `32` | |
 | `lr` | `2e-4` | from the DCGAN paper |
@@ -70,6 +70,13 @@ be made at any point from any run.
 Start at 64px. A crisp small model that interpolates smoothly is more useful
 than a soft large one, and a few thousand glyphs will not support a 256px
 discriminator without memorising them.
+
+Budget training in **steps, not epochs**. A few hundred glyphs make an epoch
+only a handful of steps, so an epoch count carried over from a large dataset
+trains for almost no time at all. Aim for 20,000+ steps, and raise `width` only
+as the dataset grows — at `1024` the model has more parameters than it has
+pixels to fit, and the generator collapses to a fixed pattern that ignores its
+latent input entirely.
 
 ## Output
 

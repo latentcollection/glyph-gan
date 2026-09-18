@@ -20,7 +20,12 @@ from torchvision import datasets, transforms
 
 LATENT = 200
 BASE = 4
-MAX_CH = 1024
+
+# Channels at the 4x4 stage, halving outward. 1024 (the width the original
+# DCGAN paper used against ~100k images) gives a 25M-parameter model that
+# collapses on a few hundred glyphs - it memorises rather than generalises, and
+# the generator stops varying with z at all. Raise it as the dataset grows.
+DEFAULT_WIDTH = 256
 
 # Targets land at +/-0.9 rather than +/-1. tanh only approaches its asymptotes,
 # so a target of exactly 1.0 demands infinite pre-activation and returns zero
@@ -38,7 +43,7 @@ def pick_device() -> torch.device:
     return torch.device("cpu")
 
 
-def _stages(size: int, width: int = MAX_CH) -> list[int]:
+def _stages(size: int, width: int = DEFAULT_WIDTH) -> list[int]:
     """Channel width at each 2x stage, halving down from `width`."""
     if size < BASE * 2 or size & (size - 1):
         raise ValueError(f"size must be a power of two >= {BASE * 2}, got {size}")
@@ -47,7 +52,7 @@ def _stages(size: int, width: int = MAX_CH) -> list[int]:
 
 
 class Generator(nn.Module):
-    def __init__(self, size: int = 64, latent: int = LATENT, width: int = MAX_CH,
+    def __init__(self, size: int = 64, latent: int = LATENT, width: int = DEFAULT_WIDTH,
                  alpha: float = 0.2):
         super().__init__()
         ch = _stages(size, width)
@@ -69,7 +74,7 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, size: int = 64, width: int = MAX_CH, alpha: float = 0.2):
+    def __init__(self, size: int = 64, width: int = DEFAULT_WIDTH, alpha: float = 0.2):
         super().__init__()
         ch = list(reversed(_stages(size, width)))
 
@@ -206,7 +211,7 @@ def load_generator(checkpoint, device=None):
     device = device or pick_device()
     blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
     gen = Generator(size=blob.get("size", 64), latent=blob.get("latent", LATENT),
-                    width=blob.get("width", MAX_CH))
+                    width=blob.get("width", DEFAULT_WIDTH))
     gen.load_state_dict(blob["gen"])
     return gen.to(device).eval()
 
@@ -254,7 +259,7 @@ def render_interpolation(generator, out, keys=8, frames=60, fps=30,
     return out
 
 
-def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=MAX_CH, keep_last=3):
+def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=DEFAULT_WIDTH, keep_last=3):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -282,7 +287,7 @@ def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=MAX_CH, kee
     return path
 
 
-def save_generator(path, gen, size, width=MAX_CH):
+def save_generator(path, gen, size, width=DEFAULT_WIDTH):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"gen": gen.state_dict(), "size": size, "width": width,
@@ -296,7 +301,7 @@ def latest_checkpoint(ckpt_dir):
 
 
 def train(img_dir, size=64, epochs=50, batch_size=32, lr=2e-4, betas=(0.5, 0.999),
-          width=MAX_CH, augment=True, ckpt_dir="checkpoints", save_every=5,
+          width=DEFAULT_WIDTH, augment=True, ckpt_dir="checkpoints", save_every=5,
           resume=True, device=None, num_workers=None, log_every=20):
     """Train to `epochs`, checkpointing as it goes.
 
