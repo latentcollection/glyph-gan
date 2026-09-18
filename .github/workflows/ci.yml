@@ -1,4 +1,4 @@
-name: smoke
+name: ci
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  smoke:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,6 +16,6 @@ jobs:
       - name: Install
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
-          pip install "numpy<2" Pillow
+          pip install "numpy<2" Pillow pytest
       - name: Run checks
-        run: python tests/smoke.py
+        run: pytest -q tests/

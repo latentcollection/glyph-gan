@@ -14,7 +14,7 @@ against a discriminator that tries to tell generated glyphs from real ones.
 Training the two against each other leaves the generator with a continuous
 space of letterforms that can be walked through and sampled.
 
-The model lives in `glyphgan.py`. `glyph-gan.ipynb` is a thin driver over it.
+The model lives in `glyphgan.py`. `glyphgan.ipynb` is a thin driver over it.
 
 ## Dataset
 
@@ -105,6 +105,18 @@ mp4 that travels through a sequence of latent waypoints and loops back to the
 first. Interpolation is spherical rather than linear — a straight line between
 two Gaussian latents passes through norms the model never saw during training,
 which makes morphs sag and wash out halfway.
+
+## Development
+
+```sh
+uv sync          # environment from uv.lock
+uv run pytest    # shapes, gradients, checkpoint roundtrip, accelerator
+uv run ruff check . && uv run ruff format .
+```
+
+The test suite runs on CPU in seconds and exercises the accelerator separately,
+because several MPS kernels are missing in the torch builds available here and
+a green CPU run hides them.
 
 ## Why DCGAN
 

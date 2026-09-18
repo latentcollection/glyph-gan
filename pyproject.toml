@@ -24,12 +24,17 @@ dependencies = [
     "imageio-ffmpeg>=0.4.9",
 ]
 
-[project.optional-dependencies]
-dev = ["ruff>=0.6"]
-
 [project.urls]
 Repository = "https://github.com/latentcollection/glyph-gan"
 Dataset = "https://github.com/latentcollection/macOS-fontface-scraper"
+
+[dependency-groups]
+dev = ["ruff>=0.6", "pytest>=8"]
+
+[tool.uv]
+# A notebook and a module beside it, not a library to distribute - so the
+# project itself is not installed into the environment, only its dependencies.
+package = false
 
 [tool.ruff]
 line-length = 100
@@ -44,3 +49,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

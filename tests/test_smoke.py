@@ -1,4 +1,7 @@
-"""Shape and wiring checks. Runs on CPU in seconds; no dataset needed."""
+"""Shape and wiring checks. Seconds to run, no dataset needed.
+
+Runs under pytest, or directly as a script.
+"""
 
 import sys
 from pathlib import Path
@@ -9,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import glyphgan as gg
 
 
-def check_shapes():
+def test_shapes():
     for size in (64, 128):
         gen, dis = gg.Generator(size), gg.Discriminator(size)
         out = gen(torch.randn(2, gg.LATENT))
@@ -18,13 +21,13 @@ def check_shapes():
         assert out.min() >= -1.0 and out.max() <= 1.0, "tanh range"
 
 
-def check_width():
+def test_width():
     small = gg.Generator(64, width=256)
     big = gg.Generator(64, width=1024)
     assert sum(p.numel() for p in small.parameters()) < sum(p.numel() for p in big.parameters())
 
 
-def check_train_step():
+def test_train_step():
     dev = torch.device("cpu")
     gen, dis = gg.Generator(64).to(dev), gg.Discriminator(64).to(dev)
     og = torch.optim.Adam(gen.parameters(), 2e-4, betas=(0.5, 0.999))
@@ -34,7 +37,7 @@ def check_train_step():
     assert ld == ld and lg == lg, "loss is NaN"
 
 
-def check_slerp_norm():
+def test_slerp_norm():
     a, b = torch.randn(1, 200), torch.randn(1, 200)
     mid = gg.slerp(a, b, 0.5).norm().item()
     ends = (a.norm().item() + b.norm().item()) / 2
@@ -42,7 +45,7 @@ def check_slerp_norm():
     assert mid > 0.9 * ends, f"slerp midpoint norm {mid:.2f} vs ends {ends:.2f}"
 
 
-def check_labels_uniform():
+def test_labels_uniform():
     counts = torch.zeros(8)
     for _ in range(2000):
         real, _ = gg._soft_labels((8, 1), torch.device("cpu"), flip_rate=0.03)
@@ -51,7 +54,7 @@ def check_labels_uniform():
     assert rate.max() < 0.08, f"flips not uniform across the batch: {rate.tolist()}"
 
 
-def check_augment():
+def test_augment():
     x = (torch.rand(4, 1, 64, 64) * 1.8 - 0.9).requires_grad_(True)
     y = gg.diff_augment(x)
     assert y.shape == x.shape, y.shape
@@ -59,7 +62,7 @@ def check_augment():
     assert x.grad.abs().sum() > 0, "augment must be differentiable"
 
 
-def check_accelerator():
+def test_accelerator():
     """Exercise the real device.
 
     CPU-only tests hide backend gaps - MPS has no grid_sample border padding
@@ -80,31 +83,31 @@ def check_accelerator():
     assert out.shape == (2, 1, 64, 64)
 
 
-def check_checkpoint_roundtrip(tmp):
+def test_checkpoint_roundtrip(tmp_path):
     gen, dis = gg.Generator(64, width=256), gg.Discriminator(64, width=256)
     og = torch.optim.Adam(gen.parameters(), 2e-4)
     od = torch.optim.Adam(dis.parameters(), 2e-4)
-    gg.save_checkpoint(tmp / "epoch0000.pt", gen, dis, og, od, 0, 64, 256)
-    assert (tmp / "generator.pt").exists(), "light generator checkpoint missing"
-    loaded = gg.load_generator(tmp / "generator.pt", torch.device("cpu"))
+    gg.save_checkpoint(tmp_path / "step0000000.pt", gen, dis, og, od, 0, 64, 256)
+    assert (tmp_path / "generator.pt").exists(), "light generator checkpoint missing"
+    loaded = gg.load_generator(tmp_path / "generator.pt", torch.device("cpu"))
     assert loaded(torch.randn(1, gg.LATENT)).shape == (1, 1, 64, 64)
 
 
 if __name__ == "__main__":
     import tempfile
 
-    tmp = Path(tempfile.mkdtemp())
+    tmp_path = Path(tempfile.mkdtemp())
     for fn in (
-        check_shapes,
-        check_width,
-        check_train_step,
-        check_slerp_norm,
-        check_labels_uniform,
-        check_augment,
-        check_accelerator,
+        test_shapes,
+        test_width,
+        test_train_step,
+        test_slerp_norm,
+        test_labels_uniform,
+        test_augment,
+        test_accelerator,
     ):
         fn()
         print(f"ok  {fn.__name__}")
-    check_checkpoint_roundtrip(tmp)
-    print("ok  check_checkpoint_roundtrip")
+    test_checkpoint_roundtrip(tmp_path)
+    print("ok  test_checkpoint_roundtrip")
     print("\nall checks passed")
