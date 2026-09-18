@@ -157,16 +157,23 @@ def _contrast(x):
 
 
 def _translate(x, ratio=0.125):
-    # One grid_sample rather than a slice per sample. Border padding keeps the
-    # glyph background at the edges instead of introducing mid-grey.
-    n = x.size(0)
-    theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
-    theta[:, 0, 0] = 1
-    theta[:, 1, 1] = 1
-    theta[:, 0, 2] = (torch.rand(n, device=x.device) * 2 - 1) * ratio * 2
-    theta[:, 1, 2] = (torch.rand(n, device=x.device) * 2 - 1) * ratio * 2
-    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
-    return F.grid_sample(x, grid, padding_mode="border", align_corners=False)
+    """Random per-sample shift, vectorised.
+
+    Uses gather-style indexing rather than grid_sample: MPS implements neither
+    border padding nor grid_sampler's backward pass, and the augment has to be
+    differentiable for DiffAugment to mean anything.
+    """
+    n, _, h, w = x.shape
+    pad = max(1, int(h * ratio + 0.5))
+    bg = -TARGET_SCALE
+    p = F.pad(x - bg, (pad, pad, pad, pad)) + bg
+
+    oy = torch.randint(0, 2 * pad + 1, (n, 1, 1), device=x.device)
+    ox = torch.randint(0, 2 * pad + 1, (n, 1, 1), device=x.device)
+    ys = oy + torch.arange(h, device=x.device).view(1, h, 1)
+    xs = ox + torch.arange(w, device=x.device).view(1, 1, w)
+    b = torch.arange(n, device=x.device).view(n, 1, 1)
+    return p[b, :, ys, xs].permute(0, 3, 1, 2).contiguous()
 
 
 def _cutout(x, ratio=0.5):
@@ -243,12 +250,10 @@ class EMA:
         self.step += 1
         d = min(self.decay, (1 + self.step) / (10 + self.step))
         cur = model.state_dict()
-        # One fused call per operation instead of one per tensor. The model has
-        # dozens of parameter tensors and on this backend each launch costs more
-        # than the arithmetic it carries.
-        shadows = [self.shadow[k] for k in self._float]
-        torch._foreach_mul_(shadows, d)
-        torch._foreach_add_(shadows, [cur[k] for k in self._float], alpha=1 - d)
+        # A fused torch._foreach_mul_/_add_ would collapse these launches, but
+        # MPS implements neither, so the per-tensor loop is the portable form.
+        for k in self._float:
+            self.shadow[k].mul_(d).add_(cur[k], alpha=1 - d)
         for k in self._other:
             self.shadow[k] = cur[k].detach().clone()
 
