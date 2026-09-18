@@ -1,6 +1,6 @@
 [project]
 name = "glyphgan"
-version = "1.0.0"
+version = "2.0.0"
 description = "DCGAN trained on glyphs, with a latent-space interpolation video as the output"
 readme = "README.md"
 requires-python = ">=3.10"
