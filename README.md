@@ -135,17 +135,19 @@ without that constraint, and is built in.
 ## Credits
 
 Architecture after Radford et al., *Unsupervised Representation Learning with
-Deep Convolutional Generative Adversarial Networks* (2015). Implementation
-derived from the [PyTorch DCGAN tutorial](https://docs.pytorch.org/tutorials/beginner/dcgan_faces_tutorial.html)
-(BSD-3-Clause). Label smoothing and label flipping follow
-[ganhacks](https://github.com/soumith/ganhacks).
+Deep Convolutional Generative Adversarial Networks* (2015). The implementation
+follows the [PyTorch DCGAN tutorial](https://docs.pytorch.org/tutorials/beginner/dcgan_faces_tutorial.html);
+label smoothing and label flipping follow
+[ganhacks](https://github.com/soumith/ganhacks). See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 Originally inspired by [Ritchie Vink's post on GANs and the distribution of
 art](https://www.ritchievink.com/blog/2018/07/16/generative-adversarial-networks-in-pytorch-the-distribution-of-art/).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). This covers the code and nothing it reads or
+MIT, see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+This covers the code and nothing it reads or
 produces — glyphs rendered from fonts you have licensed but do not own are a
 separate question, and `fontscrape --license OFL` narrows a dataset to faces
 that declare permissive terms.
