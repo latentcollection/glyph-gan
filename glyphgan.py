@@ -43,11 +43,11 @@ LATENT = 200
 
 BASE = 4
 
-# Channels at the 4x4 stage, halving outward. 1024 (the width the original
+# Channels at the 4x4 stage, halving outward. 1024 (what the original
 # DCGAN paper used against ~100k images) gives a 25M-parameter model that
 # collapses on a few hundred glyphs - it memorises rather than generalises, and
 # the generator stops varying with z at all. Raise it as the dataset grows.
-DEFAULT_WIDTH = 256
+DEFAULT_CHANNELS = 256
 
 # Targets land at +/-0.9 rather than +/-1. tanh only approaches its asymptotes,
 # so a target of exactly 1.0 demands infinite pre-activation and returns zero
@@ -96,20 +96,24 @@ def _write_video(frames: list[np.ndarray], out: str | Path, fps: int) -> Path:
 # --- models --------------------------------------------------------------------
 
 
-def _stages(size: int, width: int = DEFAULT_WIDTH) -> list[int]:
-    """Channel width at each 2x stage, halving down from `width`."""
+def _stages(size: int, channels: int = DEFAULT_CHANNELS) -> list[int]:
+    """Feature count at each 2x stage, halving down from `channels`."""
     if size < BASE * 2 or size & (size - 1):
         raise ValueError(f"size must be a power of two >= {BASE * 2}, got {size}")
     n = int(math.log2(size // BASE))
-    return [max(width >> i, 32) for i in range(n)]
+    return [max(channels >> i, 32) for i in range(n)]
 
 
 class Generator(nn.Module):
     def __init__(
-        self, size: int = 64, latent: int = LATENT, width: int = DEFAULT_WIDTH, alpha: float = 0.2
+        self,
+        size: int = 64,
+        latent: int = LATENT,
+        channels: int = DEFAULT_CHANNELS,
+        alpha: float = 0.2,
     ):
         super().__init__()
-        ch = _stages(size, width)
+        ch = _stages(size, channels)
         self.input = nn.Linear(latent, BASE * BASE * ch[0])
 
         layers: list[nn.Module] = [nn.BatchNorm2d(ch[0]), nn.LeakyReLU(alpha)]
@@ -128,9 +132,9 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, size: int = 64, width: int = DEFAULT_WIDTH, alpha: float = 0.2):
+    def __init__(self, size: int = 64, channels: int = DEFAULT_CHANNELS, alpha: float = 0.2):
         super().__init__()
-        ch = list(reversed(_stages(size, width)))
+        ch = list(reversed(_stages(size, channels)))
 
         layers: list[nn.Module] = []
         prev = 1
@@ -184,9 +188,9 @@ class EMA:
     def state_dict(self) -> dict:
         return {k: v.clone() for k, v in self.shadow.items()}
 
-    def to_generator(self, size: int, width: int, device: torch.device) -> Generator:
+    def to_generator(self, size: int, channels: int, device: torch.device) -> Generator:
         """A Generator carrying the averaged weights, ready to sample from."""
-        gen = Generator(size, width=width).to(device)
+        gen = Generator(size, channels=channels).to(device)
         gen.load_state_dict(self.state_dict())
         return gen.eval()
 
@@ -305,7 +309,7 @@ def save_checkpoint(
     opt_d: torch.optim.Optimizer,
     step: int,
     size: int,
-    width: int = DEFAULT_WIDTH,
+    channels: int = DEFAULT_CHANNELS,
     keep_last: int = 3,
     ema: EMA | None = None,
 ) -> Path:
@@ -318,7 +322,7 @@ def save_checkpoint(
             "opt_d": opt_d.state_dict(),
             "step": step,
             "size": size,
-            "width": width,
+            "channels": channels,
             "latent": LATENT,
             "ema": ema.state_dict() if ema is not None else None,
         },
@@ -328,7 +332,7 @@ def save_checkpoint(
     # Rendering needs the generator alone, so keep a light copy next to the
     # full checkpoints - roughly a fifth the size, and the only file worth
     # keeping once a run is finished.
-    save_generator(path.parent / "generator.pt", ema if ema is not None else gen, size, width)
+    save_generator(path.parent / "generator.pt", ema if ema is not None else gen, size, channels)
 
     # Full checkpoints carry both models and both Adam states, so they run to
     # a few hundred MB each. Keep only the most recent few.
@@ -340,11 +344,13 @@ def save_checkpoint(
 
 
 def save_generator(
-    path: str | Path, gen: HasStateDict, size: int, width: int = DEFAULT_WIDTH
+    path: str | Path, gen: HasStateDict, size: int, channels: int = DEFAULT_CHANNELS
 ) -> Path:
     """`gen` may be a Generator or an EMA wrapper - both expose state_dict()."""
     path = _ensure_parent(path)
-    torch.save({"gen": gen.state_dict(), "size": size, "width": width, "latent": LATENT}, path)
+    torch.save(
+        {"gen": gen.state_dict(), "size": size, "channels": channels, "latent": LATENT}, path
+    )
     return path
 
 
@@ -354,7 +360,8 @@ def load_generator(checkpoint: str | Path, device: torch.device | None = None) -
     gen = Generator(
         size=blob.get("size", 64),
         latent=blob.get("latent", LATENT),
-        width=blob.get("width", DEFAULT_WIDTH),
+        # Checkpoints written before the rename store "width".
+        channels=blob.get("channels", blob.get("width", DEFAULT_CHANNELS)),
     )
     gen.load_state_dict(blob["gen"])
     return gen.to(device).eval()
@@ -445,7 +452,7 @@ def train(
     batch_size: int = 32,
     lr: float = 2e-4,
     betas: tuple[float, float] = (0.5, 0.999),
-    width: int = DEFAULT_WIDTH,
+    channels: int = DEFAULT_CHANNELS,
     augment: bool = True,
     ckpt_dir: str | Path = "checkpoints",
     save_every_steps: int = 2000,
@@ -473,7 +480,10 @@ def train(
         num_workers = 2 if device.type == "cuda" else 0
 
     loader = make_loader(img_dir, size=size, batch_size=batch_size, num_workers=num_workers)
-    gen, dis = Generator(size, width=width).to(device), Discriminator(size, width=width).to(device)
+    gen, dis = (
+        Generator(size, channels=channels).to(device),
+        Discriminator(size, channels=channels).to(device),
+    )
     opt_g = torch.optim.Adam(gen.parameters(), lr, betas=betas)
     opt_d = torch.optim.Adam(dis.parameters(), lr, betas=betas)
 
@@ -500,7 +510,7 @@ def train(
         max_steps = epochs * n
     params = sum(p.numel() for p in gen.parameters()) + sum(p.numel() for p in dis.parameters())
     print(
-        f"{device.type} | {size}px | width {width} | {params / 1e6:.1f}M params | "
+        f"{device.type} | {size}px | ch {channels} | {params / 1e6:.1f}M params | "
         f"batch {batch_size} | {len(cast(Sized, loader.dataset))} images | {n} steps/epoch | "
         f"{max_steps} steps"
     )
@@ -509,7 +519,7 @@ def train(
 
     def checkpoint(step: int) -> Path:
         return save_checkpoint(
-            ckpt_dir / f"step{step:07d}.pt", gen, dis, opt_g, opt_d, step, size, width, ema=ema
+            ckpt_dir / f"step{step:07d}.pt", gen, dis, opt_g, opt_d, step, size, channels, ema=ema
         )
 
     step = start
@@ -525,7 +535,7 @@ def train(
                     # Preview the averaged weights, since that is what renders.
                     save_preview(
                         ckpt_dir / f"preview{step:07d}.png",
-                        ema.to_generator(size, width, device),
+                        ema.to_generator(size, channels, device),
                         device=device,
                     )
                 if save_every_steps and step % save_every_steps == 0:
@@ -600,7 +610,7 @@ def render_interpolation(
     return _write_video(video, out, fps)
 
 
-def render_axis(
+def render_direction(
     gen: GeneratorSource,
     direction: torch.Tensor,
     out: str | Path,
@@ -613,7 +623,7 @@ def render_axis(
 ) -> Path:
     """Walk a single latent direction from -span to +span and write a video.
 
-    Everything except the chosen axis is held fixed, so the result reads as one
+    Everything except the chosen direction is held fixed, so the result reads as one
     typeface being pushed along that axis rather than as a dissolve between two
     unrelated letterforms.
     """
@@ -645,13 +655,13 @@ def _extent(mask: torch.Tensor) -> torch.Tensor:
     return (hi - lo + 1).clamp(min=1).float()
 
 
-def measure_weight(x: torch.Tensor) -> torch.Tensor:
-    """Ink coverage - a proxy for typographic weight."""
+def measure_ink(x: torch.Tensor) -> torch.Tensor:
+    """Ink coverage: a measurable proxy for a face's weight."""
     return (x > 0).float().mean(dim=(1, 2, 3))
 
 
-def measure_aspect(x: torch.Tensor) -> torch.Tensor:
-    """Ink bounding-box width/height - a proxy for condensed vs extended."""
+def measure_extent(x: torch.Tensor) -> torch.Tensor:
+    """Ink bounding-box width over height: a proxy for a face's width."""
     m = x > 0
     return _extent(m.any(dim=2).squeeze(1)) / _extent(m.any(dim=3).squeeze(1))
 
@@ -670,11 +680,11 @@ def find_direction(
     directly. Instead sample the latent space, measure the property on each
     output, and least-squares regress the property against the latent: the
     fitted coefficients point the way the property grows. Walking that vector
-    traverses one typographic axis deliberately, rather than drifting between
+    traverses one typographic property deliberately, rather than drifting between
     arbitrary points the way a random interpolation does.
 
     Returns the unit direction and the correlation it achieves - a low
-    correlation means the model never learned that axis, usually because the
+    correlation means the model never learned that property, usually because the
     dataset normalised it away.
     """
     device = device or pick_device()

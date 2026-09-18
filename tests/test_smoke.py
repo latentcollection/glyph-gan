@@ -21,9 +21,9 @@ def test_shapes():
         assert out.min() >= -1.0 and out.max() <= 1.0, "tanh range"
 
 
-def test_width():
-    small = gg.Generator(64, width=256)
-    big = gg.Generator(64, width=1024)
+def test_channels():
+    small = gg.Generator(64, channels=256)
+    big = gg.Generator(64, channels=1024)
     assert sum(p.numel() for p in small.parameters()) < sum(p.numel() for p in big.parameters())
 
 
@@ -72,7 +72,7 @@ def test_accelerator():
     if dev.type == "cpu":
         print("    (no accelerator; skipped)")
         return
-    gen, dis = gg.Generator(64, width=64).to(dev), gg.Discriminator(64, width=64).to(dev)
+    gen, dis = gg.Generator(64, channels=64).to(dev), gg.Discriminator(64, channels=64).to(dev)
     og = torch.optim.Adam(gen.parameters(), 2e-4, betas=(0.5, 0.999))
     od = torch.optim.Adam(dis.parameters(), 2e-4, betas=(0.5, 0.999))
     x = torch.rand(4, 1, 64, 64) * 1.8 - 0.9
@@ -84,7 +84,7 @@ def test_accelerator():
 
 
 def test_checkpoint_roundtrip(tmp_path):
-    gen, dis = gg.Generator(64, width=256), gg.Discriminator(64, width=256)
+    gen, dis = gg.Generator(64, channels=256), gg.Discriminator(64, channels=256)
     og = torch.optim.Adam(gen.parameters(), 2e-4)
     od = torch.optim.Adam(dis.parameters(), 2e-4)
     gg.save_checkpoint(tmp_path / "step0000000.pt", gen, dis, og, od, 0, 64, 256)
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     tmp_path = Path(tempfile.mkdtemp())
     for fn in (
         test_shapes,
-        test_width,
+        test_channels,
         test_train_step,
         test_slerp_norm,
         test_labels_uniform,

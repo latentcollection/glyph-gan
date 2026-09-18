@@ -60,7 +60,7 @@ be made at any point from any run.
 | | Default | |
 |---|---|---|
 | `size` | `64` | output resolution; a power of two. Layer count follows it |
-| `width` | `256` | channels at the 4×4 stage, halving outward |
+| `channels` | `256` | feature count at the 4×4 stage, halving outward |
 | `max_steps` | `20000` | optimiser steps; the real training budget |
 | `batch_size` | `32` | |
 | `lr` | `2e-4` | from the DCGAN paper |
@@ -73,7 +73,7 @@ discriminator without memorising them.
 
 Budget training in **steps, not epochs**. A few hundred glyphs make an epoch
 only a handful of steps, so an epoch count carried over from a large dataset
-trains for almost no time at all. Aim for 20,000+ steps, and raise `width` only
+trains for almost no time at all. Aim for 20,000+ steps, and raise `channels` only
 as the dataset grows — at `1024` the model has more parameters than it has
 pixels to fit, and the generator collapses to a fixed pattern that ignores its
 latent input entirely.
@@ -85,7 +85,7 @@ load with the CPU thermally throttled to 70% — so these are realistic numbers
 rather than cool-start ones. A cool machine runs roughly 40% faster for the
 first few minutes.
 
-| size | width | batch | s/step | 12k steps | 20k steps |
+| size | channels | batch | s/step | 12k steps | 20k steps |
 |---|---|---|---|---|---|
 | 64 | 256 | 32 | 0.34 | 68 min | 113 min |
 | 64 | 256 | 64 | 0.49 | 97 min | 162 min |
@@ -105,6 +105,11 @@ mp4 that travels through a sequence of latent waypoints and loops back to the
 first. Interpolation is spherical rather than linear — a straight line between
 two Gaussian latents passes through norms the model never saw during training,
 which makes morphs sag and wash out halfway.
+
+## Glossary
+
+`width` and `axis` describe faces, never the model - the network's feature
+count is `channels`. [GLOSSARY.md](GLOSSARY.md) has the rest.
 
 ## Development
 
