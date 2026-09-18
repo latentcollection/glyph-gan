@@ -1,11 +1,15 @@
 # GlyphGAN
 
-<img src="./thumbnail.png" alt="Generated glyphs" width="320">
+<img src="./docs/interpolation.gif" alt="Interpolated glyph shapes" width="320">
 
 GlyphGAN trains a DCGAN on rasterised glyphs and renders a video that walks
 through the latent space between them. The interpolation is the output: one
 letterform morphing continuously into another through shapes that sit between
 real typefaces.
+
+<img src="./docs/thumbnail-2020.jpg" alt="Generated glyphs" width="320">
+
+<img src="./docs/width-axis.png" alt="Width axis">
 
 ## How it works
 
@@ -18,7 +22,7 @@ The model lives in `glyphgan.py`. `glyphgan.ipynb` is a thin driver over it.
 
 ## Dataset
 
-Any folder of images laid out for `torchvision.ImageFolder` works — one
+Any folder of images laid out for `torchvision.ImageFolder` works. One
 subdirectory per class, images inside.
 
 To build one from the fonts installed on a Mac, use
@@ -57,16 +61,16 @@ be made at any point from any run.
 
 ## Hyperparameters
 
-| | Default | |
-|---|---|---|
-| `size` | `64` | output resolution; a power of two. Layer count follows it |
-| `channels` | `256` | feature count at the 4×4 stage, halving outward |
-| `spectral` | `True` | spectral norm in the discriminator instead of batchnorm |
-| `max_steps` | `20000` | optimiser steps; the real training budget |
-| `batch_size` | `32` | |
-| `lr` | `2e-4` | from the DCGAN paper |
-| `betas` | `(0.5, 0.999)` | likewise |
-| `LATENT` | `200` | latent vector size |
+|              | Default        |                                                           |
+| ------------ | -------------- | --------------------------------------------------------- |
+| `size`       | `64`           | output resolution; a power of two. Layer count follows it |
+| `channels`   | `256`          | feature count at the 4×4 stage, halving outward           |
+| `spectral`   | `True`         | spectral norm in the discriminator instead of batchnorm   |
+| `max_steps`  | `20000`        | optimiser steps; the real training budget                 |
+| `batch_size` | `32`           |                                                           |
+| `lr`         | `2e-4`         | from the DCGAN paper                                      |
+| `betas`      | `(0.5, 0.999)` | likewise                                                  |
+| `LATENT`     | `200`          | latent vector size                                        |
 
 Start at 64px. A crisp small model that interpolates smoothly is more useful
 than a soft large one, and a few thousand glyphs will not support a 256px
@@ -75,26 +79,26 @@ discriminator without memorising them.
 Budget training in **steps, not epochs**. A few hundred glyphs make an epoch
 only a handful of steps, so an epoch count carried over from a large dataset
 trains for almost no time at all. Aim for 20,000+ steps, and raise `channels` only
-as the dataset grows — at `1024` the model has more parameters than it has
+as the dataset grows. At `1024` the model has more parameters than it has
 pixels to fit, and the generator collapses to a fixed pattern that ignores its
 latent input entirely.
 
 ## Performance
 
 Measured on a 2017 Intel MacBook Pro (Radeon Pro 560) via MPS, under sustained
-load with the CPU thermally throttled to 70% — so these are realistic numbers
+load with the CPU thermally throttled to 70%. So these are realistic numbers
 rather than cool-start ones. A cool machine runs roughly 40% faster for the
 first few minutes.
 
 | size | channels | batch | s/step | 12k steps | 20k steps |
-|---|---|---|---|---|---|
-| 64 | 256 | 32 | 0.34 | 68 min | 113 min |
-| 64 | 256 | 64 | 0.49 | 97 min | 162 min |
-| 64 | 512 | 32 | 0.67 | 135 min | 224 min |
-| 128 | 256 | 32 | 0.57 | 113 min | 189 min |
-| 128 | 512 | 32 | 0.93 | 187 min | 311 min |
+| ---- | -------- | ----- | ------ | --------- | --------- |
+| 64   | 256      | 32    | 0.34   | 68 min    | 113 min   |
+| 64   | 256      | 64    | 0.49   | 97 min    | 162 min   |
+| 64   | 512      | 32    | 0.67   | 135 min   | 224 min   |
+| 128  | 256      | 32    | 0.57   | 113 min   | 189 min   |
+| 128  | 512      | 32    | 0.93   | 187 min   | 311 min   |
 
-Dataset size does not affect step time — a step costs one batch whatever the
+Dataset size does not affect step time. A step costs one batch whatever the
 dataset holds, so growing it is free in wall-clock. Raising `batch_size` past 32
 is slower here, not faster: the GPU is already saturated and the larger batch
 just serialises.
@@ -103,7 +107,7 @@ just serialises.
 
 Training prints losses and writes checkpoints. `render_interpolation` writes an
 mp4 that travels through a sequence of latent waypoints and loops back to the
-first. Interpolation is spherical rather than linear — a straight line between
+first. Interpolation is spherical rather than linear. A straight line between
 two Gaussian latents passes through norms the model never saw during training,
 which makes morphs sag and wash out halfway.
 
@@ -134,13 +138,13 @@ published artwork. DiffAugment (BSD-2) gets most of the small-data benefit
 without that constraint, and is built in.
 
 The discriminator uses spectral normalisation rather than the paper's
-batchnorm — batchnorm couples samples within a batch, and at batch 32 those
+batchnorm. Batchnorm couples samples within a batch, and at batch 32 those
 statistics are noisy. It costs about 19% more per step.
 
 ## Credits
 
-Architecture after Radford et al., *Unsupervised Representation Learning with
-Deep Convolutional Generative Adversarial Networks* (2015). The implementation
+Architecture after Radford et al., _Unsupervised Representation Learning with
+Deep Convolutional Generative Adversarial Networks_ (2015). The implementation
 follows the [PyTorch DCGAN tutorial](https://docs.pytorch.org/tutorials/beginner/dcgan_faces_tutorial.html);
 label smoothing and label flipping follow
 [ganhacks](https://github.com/soumith/ganhacks). See
@@ -149,10 +153,15 @@ label smoothing and label flipping follow
 Originally inspired by [Ritchie Vink's post on GANs and the distribution of
 art](https://www.ritchievink.com/blog/2018/07/16/generative-adversarial-networks-in-pytorch-the-distribution-of-art/).
 
+## Related
+
+[macOS-fontface-scraper](https://github.com/latentcollection/macOS-fontface-scraper),
+the tool that builds the datasets this trains on.
+
 ## License
 
 MIT, see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 This covers the code and nothing it reads or
-produces — glyphs rendered from fonts you have licensed but do not own are a
+produces. Glyphs rendered from fonts you have licensed but do not own are a
 separate question, and `fontscrape --license OFL` narrows a dataset to faces
 that declare permissive terms.

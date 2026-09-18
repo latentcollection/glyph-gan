@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sized
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -76,13 +77,42 @@ def _ensure_parent(path: str | Path) -> Path:
 
 
 def _resolve(generator: GeneratorSource, device: torch.device) -> nn.Module:
-    """A live module or a checkpoint path, either way ready to sample from."""
+    """A live module or a checkpoint path, either way on `device`.
+
+    Deliberately does not change training mode - the caller may have handed us
+    a generator that is mid-run, and leaving it in eval() would silently freeze
+    its BatchNorm for the rest of training. Use `_sampling` for that.
+    """
     gen = generator if isinstance(generator, nn.Module) else load_generator(generator, device)
-    return gen.to(device).eval()
+    return gen.to(device)
+
+
+@contextmanager
+def _sampling(gen: nn.Module):
+    """Evaluate `gen`, then restore whatever mode the caller had it in."""
+    was_training = gen.training
+    gen.eval()
+    try:
+        yield gen
+    finally:
+        gen.train(was_training)
+
+
+def _latent_of(gen: nn.Module) -> int:
+    """A generator's own latent size, rather than assuming the module default."""
+    inp = getattr(gen, "input", None)
+    return getattr(inp, "in_features", LATENT)
 
 
 def _write_video(frames: list[np.ndarray], out: str | Path, fps: int) -> Path:
-    import imageio.v2 as imageio
+    if not frames:
+        raise ValueError("no frames to write")
+    try:
+        import imageio.v2 as imageio
+    except ImportError as exc:
+        raise RuntimeError(
+            "writing video needs imageio: pip install imageio imageio-ffmpeg"
+        ) from exc
 
     out = _ensure_parent(out)
     try:
@@ -392,7 +422,7 @@ def save_generator(
 
 def load_generator(checkpoint: str | Path, device: torch.device | None = None) -> nn.Module:
     device = device or pick_device()
-    blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
+    blob = torch.load(Path(checkpoint), map_location=device, weights_only=True)
     gen = Generator(
         size=blob.get("size", 64),
         latent=blob.get("latent", LATENT),
@@ -420,12 +450,9 @@ def save_preview(
 
     device = device or pick_device()
     g = torch.Generator().manual_seed(seed)
-    z = torch.randn(n, LATENT, generator=g).to(device)
-    was_training = gen.training
-    gen.eval()
-    with torch.no_grad():
+    z = torch.randn(n, _latent_of(gen), generator=g).to(device)
+    with _sampling(gen), torch.no_grad():
         sheet = np.hstack([to_image(v) for v in gen(z)])
-    gen.train(was_training)
     path = _ensure_parent(path)
     Image.fromarray(sheet).save(path)
     return path
@@ -511,38 +538,52 @@ def train(
     an unsaved generator is a run you cannot render a video from.
     """
     device = device or pick_device()
+    # make_loader caches the dataset in memory and then has nothing for worker
+    # processes to overlap, so this stays 0 unless caching is turned off.
     if num_workers is None:
-        # Worker processes spawn rather than fork off CUDA, and on macOS that
-        # deadlocks inside notebooks often enough not to be worth the speedup.
-        num_workers = 2 if device.type == "cuda" else 0
+        num_workers = 0
 
     loader = make_loader(img_dir, size=size, batch_size=batch_size, num_workers=num_workers)
+    n = len(loader)
+    if n == 0:
+        raise ValueError(
+            f"{len(cast(Sized, loader.dataset))} images at batch_size {batch_size} with "
+            "drop_last leaves no batches; lower batch_size or add images"
+        )
     gen = Generator(size, channels=channels).to(device)
     dis = Discriminator(size, channels=channels, spectral=spectral).to(device)
     opt_g = torch.optim.Adam(gen.parameters(), lr, betas=betas)
     opt_d = torch.optim.Adam(dis.parameters(), lr, betas=betas)
 
-    ema = EMA(gen)
     start = 0
     if resume:
         found = latest_checkpoint(ckpt_dir)
         if found:
-            blob = torch.load(found, map_location=device, weights_only=False)
+            blob = torch.load(found, map_location=device, weights_only=True)
             gen.load_state_dict(blob["gen"])
             dis.load_state_dict(blob["dis"])
             # Checkpoints written before the key was renamed store "epoch",
             # though the value was always a step count.
             start = blob.get("step", blob.get("epoch", 0))
-            if blob.get("ema"):
-                ema.shadow = {k: v.to(device) for k, v in blob["ema"].items()}
-                ema.step = start
             opt_g.load_state_dict(blob["opt_g"])
             opt_d.load_state_dict(blob["opt_d"])
             print(f"resumed {found.name} at step {start}")
 
-    n = len(loader)
+    # Built after any restore, so the shadow starts from the restored weights
+    # rather than from random initialisation.
+    ema = EMA(gen)
+    if resume:
+        found = latest_checkpoint(ckpt_dir)
+        if found:
+            blob = torch.load(found, map_location=device, weights_only=True)
+            if blob.get("ema"):
+                ema.shadow = {k: v.to(device) for k, v in blob["ema"].items()}
+                ema.step = start
+
     if epochs is not None:
-        max_steps = epochs * n
+        # A pass count is relative to where this run starts, so resuming with
+        # the same `epochs` trains that many more passes rather than none.
+        max_steps = start + epochs * n
     params = sum(p.numel() for p in gen.parameters()) + sum(p.numel() for p in dis.parameters())
     print(
         f"{device.type} | {size}px | ch {channels} | {params / 1e6:.1f}M params | "
@@ -626,6 +667,8 @@ def render_interpolation(
     depends on training state, so a video can be rendered from any checkpoint
     at any time.
     """
+    if frames < 1:
+        raise ValueError(f"frames must be at least 1, got {frames}")
     device = device or pick_device()
     gen = _resolve(generator, device)
 
@@ -633,13 +676,15 @@ def render_interpolation(
         g = torch.Generator(device="cpu")
         if seed is not None:
             g.manual_seed(seed)
-        latent = gen.input.in_features
-        keys = [torch.randn(1, latent, generator=g).to(device) for _ in range(keys)]
+        keys = [torch.randn(1, _latent_of(gen), generator=g).to(device) for _ in range(keys)]
+    keys = list(keys)
+    if len(keys) < 2:
+        raise ValueError("interpolation needs at least two waypoints")
     if loop:
-        keys = list(keys) + [keys[0]]
+        keys = keys + [keys[0]]
 
     video = []
-    with torch.no_grad():
+    with _sampling(gen), torch.no_grad():
         for a, b in zip(keys, keys[1:], strict=False):
             video += [to_image(gen(slerp(a, b, k / frames))[0]) for k in range(frames)]
     return _write_video(video, out, fps)
@@ -662,16 +707,18 @@ def render_direction(
     typeface being pushed along that axis rather than as a dissolve between two
     unrelated letterforms.
     """
+    if frames < 2:
+        raise ValueError(f"walking an axis needs at least 2 frames, got {frames}")
     device = device or pick_device()
     gen = _resolve(gen, device)
     if base is None:
         g = torch.Generator().manual_seed(seed)
-        base = torch.randn(1, LATENT, generator=g)
+        base = torch.randn(1, _latent_of(gen), generator=g)
     base = base.to(device)
     d = direction.to(device).unsqueeze(0)
 
     video = []
-    with torch.no_grad():
+    with _sampling(gen), torch.no_grad():
         for i in range(frames):
             t = -span + 2 * span * i / (frames - 1)
             video.append(to_image(gen(base + t * d)[0]))
@@ -723,12 +770,13 @@ def find_direction(
     dataset normalised it away.
     """
     device = device or pick_device()
-    gen = gen.to(device).eval()
+    gen = gen.to(device)
+    latent = _latent_of(gen)
     g = torch.Generator().manual_seed(seed)
     zs, ys = [], []
-    with torch.no_grad():
+    with _sampling(gen), torch.no_grad():
         for _ in range(0, n, batch):
-            z = torch.randn(batch, LATENT, generator=g).to(device)
+            z = torch.randn(batch, latent, generator=g).to(device)
             zs.append(z.cpu())
             ys.append(measure(gen(z)).cpu())
     z = torch.cat(zs).double()

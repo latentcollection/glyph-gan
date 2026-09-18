@@ -1,5 +1,6 @@
 """A training step, its label noise and augment, and the whole loop."""
 
+import pytest
 import torch
 
 import glyphgan as gg
@@ -56,3 +57,50 @@ def test_train_resume_render(dataset, tmp_path):
         ck / "generator.pt", tmp_path / "v.mp4", keys=3, frames=4, device=torch.device("cpu")
     )
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_empty_loader_is_rejected(tmp_path):
+    """Fewer images than batch_size with drop_last leaves no batches at all.
+
+    The loop used to spin on an empty loader forever, producing no output and
+    no checkpoint.
+    """
+    d = tmp_path / "tiny" / "a"
+    d.mkdir(parents=True)
+    import numpy as np
+    from PIL import Image
+
+    for i in range(2):
+        Image.fromarray(np.zeros((16, 16), dtype="uint8")).save(d / f"{i}.png")
+    with pytest.raises(ValueError, match="no batches"):
+        gg.train(
+            tmp_path / "tiny",
+            size=16,
+            channels=32,
+            batch_size=8,
+            max_steps=2,
+            ckpt_dir=tmp_path / "ck",
+            device=torch.device("cpu"),
+        )
+
+
+def test_resume_with_epochs_makes_progress(dataset, tmp_path):
+    """`epochs` counts passes from where this run starts, not from zero.
+
+    Computed from zero, resuming with the same value left max_steps at or below
+    the restored step and the run returned immediately.
+    """
+    ck = tmp_path / "ck"
+    kw = {
+        "size": 16,
+        "channels": 32,
+        "batch_size": 4,
+        "ckpt_dir": ck,
+        "device": torch.device("cpu"),
+        "log_every": 99,
+    }
+    gg.train(dataset, epochs=1, **kw)
+    first = torch.load(gg.latest_checkpoint(ck), map_location="cpu", weights_only=True)["step"]
+    gg.train(dataset, epochs=1, **kw)
+    second = torch.load(gg.latest_checkpoint(ck), map_location="cpu", weights_only=True)["step"]
+    assert second > first, f"resume trained no steps: {first} -> {second}"
