@@ -1,6 +1,6 @@
 # GlyphGAN
 
-<img src="./thumbnail.jpg" alt="Thumbnail" style="width: 300px; display: block;">
+<img src="./thumbnail.png" alt="Generated glyphs" width="320">
 
 GlyphGAN trains a DCGAN on rasterised glyphs and renders a video that walks
 through the latent space between them. The interpolation is the output: one
