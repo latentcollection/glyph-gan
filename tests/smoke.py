@@ -73,8 +73,14 @@ if __name__ == "__main__":
     import tempfile
 
     tmp = Path(tempfile.mkdtemp())
-    for fn in (check_shapes, check_width, check_train_step, check_slerp_norm,
-               check_labels_uniform, check_augment):
+    for fn in (
+        check_shapes,
+        check_width,
+        check_train_step,
+        check_slerp_norm,
+        check_labels_uniform,
+        check_augment,
+    ):
         fn()
         print(f"ok  {fn.__name__}")
     check_checkpoint_roundtrip(tmp)

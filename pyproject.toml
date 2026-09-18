@@ -1,0 +1,46 @@
+[project]
+name = "glyphgan"
+version = "1.0.0"
+description = "DCGAN trained on glyphs, with a latent-space interpolation video as the output"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Moritz Salla" }]
+
+dependencies = [
+    # Intel Macs are capped at torch 2.2.x - the last release with x86_64 macOS
+    # wheels - and that build predates the NumPy 2 ABI, so `import torch` fails
+    # outright against NumPy 2. Both pins are scoped to that platform; anywhere
+    # else (Linux, Apple Silicon, Colab) gets current torch and NumPy.
+    "numpy<2; platform_system == 'Darwin' and platform_machine == 'x86_64'",
+    "numpy>=1.26; platform_system != 'Darwin' or platform_machine != 'x86_64'",
+    "torch>=2.2,<2.3; platform_system == 'Darwin' and platform_machine == 'x86_64'",
+    "torch>=2.2; platform_system != 'Darwin' or platform_machine != 'x86_64'",
+    "torchvision>=0.17",
+    "pillow>=10",
+    "matplotlib>=3.7",
+    # mp4 output goes through ffmpeg, which imageio does not bundle
+    "imageio>=2.31",
+    "imageio-ffmpeg>=0.4.9",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+[project.urls]
+Repository = "https://github.com/latentcollection/glyph-gan"
+Dataset = "https://github.com/latentcollection/macOS-fontface-scraper"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PTH"]
+ignore = [
+    "E741",  # ambiguous names like `l` are fine in tensor code
+    "B905",  # zip(strict=) is not available on the 3.9 floor
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

@@ -10,7 +10,9 @@ e.g. the output of `fontscrape --glyphs a --size 64 --mode xheight`.
 from __future__ import annotations
 
 import math
+from collections.abc import Sized
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -52,8 +54,9 @@ def _stages(size: int, width: int = DEFAULT_WIDTH) -> list[int]:
 
 
 class Generator(nn.Module):
-    def __init__(self, size: int = 64, latent: int = LATENT, width: int = DEFAULT_WIDTH,
-                 alpha: float = 0.2):
+    def __init__(
+        self, size: int = 64, latent: int = LATENT, width: int = DEFAULT_WIDTH, alpha: float = 0.2
+    ):
         super().__init__()
         ch = _stages(size, width)
         self.input = nn.Linear(latent, BASE * BASE * ch[0])
@@ -96,15 +99,18 @@ class Discriminator(nn.Module):
 
 
 def make_loader(img_dir, size=64, batch_size=64, num_workers=2) -> DataLoader:
-    tf = transforms.Compose([
-        transforms.Grayscale(1),
-        transforms.Resize((size, size), transforms.InterpolationMode.BILINEAR),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5 / TARGET_SCALE,)),
-    ])
+    tf = transforms.Compose(
+        [
+            transforms.Grayscale(1),
+            transforms.Resize((size, size), transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5 / TARGET_SCALE,)),
+        ]
+    )
     data = datasets.ImageFolder(str(img_dir), tf)
-    return DataLoader(data, batch_size=batch_size, shuffle=True,
-                      drop_last=True, num_workers=num_workers)
+    return DataLoader(
+        data, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers
+    )
 
 
 def _soft_labels(shape, device, flip_rate=0.03, smooth=0.1):
@@ -134,7 +140,7 @@ def _translate(x, ratio=0.125):
     p = F.pad(x, (pad, pad, pad, pad))
     oy = torch.randint(0, 2 * pad + 1, (n,))
     ox = torch.randint(0, 2 * pad + 1, (n,))
-    return torch.stack([p[i, :, oy[i]:oy[i] + h, ox[i]:ox[i] + w] for i in range(n)])
+    return torch.stack([p[i, :, oy[i] : oy[i] + h, ox[i] : ox[i] + w] for i in range(n)])
 
 
 def _cutout(x, ratio=0.5):
@@ -144,7 +150,7 @@ def _cutout(x, ratio=0.5):
     cx = torch.randint(0, w, (n,))
     mask = torch.ones_like(x)
     for i in range(n):
-        mask[i, :, max(0, cy[i] - ch):cy[i] + ch, max(0, cx[i] - cw):cx[i] + cw] = 0
+        mask[i, :, max(0, cy[i] - ch) : cy[i] + ch, max(0, cx[i] - cw) : cx[i] + cw] = 0
     return x * mask
 
 
@@ -171,8 +177,9 @@ def train_step(gen, dis, opt_g, opt_d, real, device, augment=False):
     pred_real = dis(aug(real))
     y_real, y_fake = _soft_labels(pred_real.shape, device)
     fake = gen(torch.randn(batch, LATENT, device=device))
-    loss_d = (F.binary_cross_entropy_with_logits(pred_real, y_real)
-              + F.binary_cross_entropy_with_logits(dis(aug(fake.detach())), y_fake))
+    loss_d = F.binary_cross_entropy_with_logits(
+        pred_real, y_real
+    ) + F.binary_cross_entropy_with_logits(dis(aug(fake.detach())), y_fake)
     loss_d.backward()
     opt_d.step()
 
@@ -183,6 +190,37 @@ def train_step(gen, dis, opt_g, opt_d, real, device, augment=False):
     opt_g.step()
 
     return loss_d.item(), loss_g.item()
+
+
+class EMA:
+    """Exponential moving average of the generator's weights.
+
+    The raw generator chases the discriminator from step to step, so its
+    samples flicker. An averaged copy sits in the middle of that oscillation
+    and renders markedly cleaner - which matters more here than usual, because
+    the output is a video where frame-to-frame instability is visible directly.
+
+    `decay` ramps in over the first steps; at a fixed 0.999 the average would
+    still be mostly its initialisation thousands of steps in.
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.step = 0
+        self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        self.step += 1
+        d = min(self.decay, (1 + self.step) / (10 + self.step))
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1 - d)
+            else:
+                self.shadow[k] = v.detach().clone()
+
+    def state_dict(self):
+        return {k: v.clone() for k, v in self.shadow.items()}
 
 
 def slerp(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
@@ -210,14 +248,18 @@ def to_image(x: torch.Tensor):
 def load_generator(checkpoint, device=None):
     device = device or pick_device()
     blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
-    gen = Generator(size=blob.get("size", 64), latent=blob.get("latent", LATENT),
-                    width=blob.get("width", DEFAULT_WIDTH))
+    gen = Generator(
+        size=blob.get("size", 64),
+        latent=blob.get("latent", LATENT),
+        width=blob.get("width", DEFAULT_WIDTH),
+    )
     gen.load_state_dict(blob["gen"])
     return gen.to(device).eval()
 
 
-def render_interpolation(generator, out, keys=8, frames=60, fps=30,
-                         loop=True, seed=None, device=None):
+def render_interpolation(
+    generator, out, keys=8, frames=60, fps=30, loop=True, seed=None, device=None
+):
     """Walk the latent space through `keys` waypoints and write a video.
 
     `generator` may be a live module or a path to a checkpoint. Nothing here
@@ -253,30 +295,35 @@ def render_interpolation(generator, out, keys=8, frames=60, fps=30,
         imageio.mimwrite(out, video, fps=fps)
     except Exception as exc:
         raise RuntimeError(
-            f"could not write {out}. mp4 output needs the ffmpeg plugin: "
-            "pip install imageio-ffmpeg"
+            f"could not write {out}. mp4 output needs the ffmpeg plugin: pip install imageio-ffmpeg"
         ) from exc
     return out
 
 
-def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=DEFAULT_WIDTH, keep_last=3):
+def save_checkpoint(
+    path, gen, dis, opt_g, opt_d, epoch, size, width=DEFAULT_WIDTH, keep_last=3, ema=None
+):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "gen": gen.state_dict(),
-        "dis": dis.state_dict(),
-        "opt_g": opt_g.state_dict(),
-        "opt_d": opt_d.state_dict(),
-        "epoch": epoch,
-        "size": size,
-        "width": width,
-        "latent": LATENT,
-    }, path)
+    torch.save(
+        {
+            "gen": gen.state_dict(),
+            "dis": dis.state_dict(),
+            "opt_g": opt_g.state_dict(),
+            "opt_d": opt_d.state_dict(),
+            "epoch": epoch,
+            "size": size,
+            "width": width,
+            "latent": LATENT,
+            "ema": ema.state_dict() if ema is not None else None,
+        },
+        path,
+    )
 
     # Rendering needs the generator alone, so keep a light copy next to the
     # full checkpoints - roughly a fifth the size, and the only file worth
     # keeping once a run is finished.
-    save_generator(path.parent / "generator.pt", gen, size, width)
+    save_generator(path.parent / "generator.pt", ema if ema is not None else gen, size, width)
 
     # Full checkpoints carry both models and both Adam states, so they run to
     # a few hundred MB each. Keep only the most recent few.
@@ -288,10 +335,10 @@ def save_checkpoint(path, gen, dis, opt_g, opt_d, epoch, size, width=DEFAULT_WID
 
 
 def save_generator(path, gen, size, width=DEFAULT_WIDTH):
+    """`gen` may be a Generator or an EMA wrapper - both expose state_dict()."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"gen": gen.state_dict(), "size": size, "width": width,
-                "latent": LATENT}, path)
+    torch.save({"gen": gen.state_dict(), "size": size, "width": width, "latent": LATENT}, path)
     return path
 
 
@@ -300,10 +347,23 @@ def latest_checkpoint(ckpt_dir):
     return found[-1] if found else None
 
 
-def train(img_dir, size=64, max_steps=20000, epochs=None, batch_size=32, lr=2e-4,
-          betas=(0.5, 0.999), width=DEFAULT_WIDTH, augment=True,
-          ckpt_dir="checkpoints", save_every_steps=2000, resume=True, device=None,
-          num_workers=None, log_every=100):
+def train(
+    img_dir,
+    size=64,
+    max_steps=20000,
+    epochs=None,
+    batch_size=32,
+    lr=2e-4,
+    betas=(0.5, 0.999),
+    width=DEFAULT_WIDTH,
+    augment=True,
+    ckpt_dir="checkpoints",
+    save_every_steps=2000,
+    resume=True,
+    device=None,
+    num_workers=None,
+    log_every=100,
+):
     """Train for `max_steps` optimiser steps, checkpointing as it goes.
 
     The budget is in steps rather than epochs on purpose. A few hundred glyphs
@@ -326,6 +386,7 @@ def train(img_dir, size=64, max_steps=20000, epochs=None, batch_size=32, lr=2e-4
     opt_g = torch.optim.Adam(gen.parameters(), lr, betas=betas)
     opt_d = torch.optim.Adam(dis.parameters(), lr, betas=betas)
 
+    ema = EMA(gen)
     start = 0
     if resume:
         found = latest_checkpoint(ckpt_dir)
@@ -333,6 +394,9 @@ def train(img_dir, size=64, max_steps=20000, epochs=None, batch_size=32, lr=2e-4
             blob = torch.load(found, map_location=device, weights_only=False)
             gen.load_state_dict(blob["gen"])
             dis.load_state_dict(blob["dis"])
+            if blob.get("ema"):
+                ema.shadow = {k: v.to(device) for k, v in blob["ema"].items()}
+                ema.step = blob["epoch"]
             opt_g.load_state_dict(blob["opt_g"])
             opt_d.load_state_dict(blob["opt_d"])
             start = blob["epoch"]
@@ -342,29 +406,50 @@ def train(img_dir, size=64, max_steps=20000, epochs=None, batch_size=32, lr=2e-4
     if epochs is not None:
         max_steps = epochs * n
     params = sum(p.numel() for p in gen.parameters()) + sum(p.numel() for p in dis.parameters())
-    print(f"{device.type} | {size}px | width {width} | {params/1e6:.1f}M params | "
-          f"batch {batch_size} | {len(loader.dataset)} images | {n} steps/epoch | "
-          f"{max_steps} steps")
+    print(
+        f"{device.type} | {size}px | width {width} | {params / 1e6:.1f}M params | "
+        f"batch {batch_size} | {len(cast(Sized, loader.dataset))} images | {n} steps/epoch | "
+        f"{max_steps} steps"
+    )
 
     step, epoch = start, start // max(n, 1)
     try:
         while step < max_steps:
             for x, _ in loader:
                 loss_d, loss_g = train_step(gen, dis, opt_g, opt_d, x, device, augment)
+                ema.update(gen)
                 step += 1
                 if step % log_every == 0:
                     print(f"step {step:6d}/{max_steps}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
                 if save_every_steps and step % save_every_steps == 0:
-                    save_checkpoint(Path(ckpt_dir) / f"step{step:07d}.pt",
-                                    gen, dis, opt_g, opt_d, step, size, width)
+                    save_checkpoint(
+                        Path(ckpt_dir) / f"step{step:07d}.pt",
+                        gen,
+                        dis,
+                        opt_g,
+                        opt_d,
+                        step,
+                        size,
+                        width,
+                        ema=ema,
+                    )
                 if step >= max_steps:
                     break
             epoch += 1
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
-        path = save_checkpoint(Path(ckpt_dir) / f"step{step:07d}.pt",
-                               gen, dis, opt_g, opt_d, step, size, width)
+        path = save_checkpoint(
+            Path(ckpt_dir) / f"step{step:07d}.pt",
+            gen,
+            dis,
+            opt_g,
+            opt_d,
+            step,
+            size,
+            width,
+            ema=ema,
+        )
         print(f"saved {path} at step {step}")
 
     return gen, dis

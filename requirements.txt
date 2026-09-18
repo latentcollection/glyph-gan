@@ -1,10 +1,15 @@
-# torch 2.2.x is the last release with macOS x86_64 wheels, and it was built
-# against the NumPy 1.x ABI - NumPy 2 makes `import torch` fail outright.
-numpy<2
+# Mirrors pyproject.toml for environments without uv (Colab, plain pip).
+#
+# Intel Macs are capped at torch 2.2.x - the last release with x86_64 macOS
+# wheels - and that build predates the NumPy 2 ABI, so `import torch` fails
+# against NumPy 2. Both pins are scoped to that platform; everywhere else
+# (Linux, Apple Silicon, Colab) gets current torch and NumPy.
+numpy<2; platform_system == "Darwin" and platform_machine == "x86_64"
+numpy>=1.26; platform_system != "Darwin" or platform_machine != "x86_64"
 torch>=2.2,<2.3; platform_system == "Darwin" and platform_machine == "x86_64"
 torch>=2.2; platform_system != "Darwin" or platform_machine != "x86_64"
 torchvision>=0.17
-Pillow>=10
+pillow>=10
 matplotlib>=3.7
 
 # mp4 output goes through ffmpeg, which imageio does not bundle
