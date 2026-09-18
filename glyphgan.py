@@ -98,7 +98,26 @@ class Discriminator(nn.Module):
         return self.output(self.net(x).reshape(-1, self.flat))
 
 
-def make_loader(img_dir, size=64, batch_size=64, num_workers=2) -> DataLoader:
+class _Cached(torch.utils.data.Dataset):
+    """Decode the dataset once and keep it in memory.
+
+    A glyph set is small - a few thousand 64px greyscale images is tens of MB -
+    but it is otherwise re-read and re-decoded from PNG on every step, which
+    costs a real slice of a step already dominated by per-op overhead rather
+    than by arithmetic.
+    """
+
+    def __init__(self, base):
+        self.tensors = torch.stack([base[i][0] for i in range(len(base))])
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __getitem__(self, i):
+        return self.tensors[i], 0
+
+
+def make_loader(img_dir, size=64, batch_size=64, num_workers=2, cache=True) -> DataLoader:
     tf = transforms.Compose(
         [
             transforms.Grayscale(1),
@@ -108,6 +127,9 @@ def make_loader(img_dir, size=64, batch_size=64, num_workers=2) -> DataLoader:
         ]
     )
     data = datasets.ImageFolder(str(img_dir), tf)
+    if cache:
+        data = _Cached(data)
+        num_workers = 0  # nothing left to overlap; workers would only add IPC
     return DataLoader(
         data, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers
     )
@@ -135,23 +157,27 @@ def _contrast(x):
 
 
 def _translate(x, ratio=0.125):
-    n, _, h, w = x.shape
-    pad = max(1, int(h * ratio + 0.5))
-    p = F.pad(x, (pad, pad, pad, pad))
-    oy = torch.randint(0, 2 * pad + 1, (n,))
-    ox = torch.randint(0, 2 * pad + 1, (n,))
-    return torch.stack([p[i, :, oy[i] : oy[i] + h, ox[i] : ox[i] + w] for i in range(n)])
+    # One grid_sample rather than a slice per sample. Border padding keeps the
+    # glyph background at the edges instead of introducing mid-grey.
+    n = x.size(0)
+    theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
+    theta[:, 0, 0] = 1
+    theta[:, 1, 1] = 1
+    theta[:, 0, 2] = (torch.rand(n, device=x.device) * 2 - 1) * ratio * 2
+    theta[:, 1, 2] = (torch.rand(n, device=x.device) * 2 - 1) * ratio * 2
+    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, padding_mode="border", align_corners=False)
 
 
 def _cutout(x, ratio=0.5):
     n, _, h, w = x.shape
     ch, cw = int(h * ratio + 0.5) // 2, int(w * ratio + 0.5) // 2
-    cy = torch.randint(0, h, (n,))
-    cx = torch.randint(0, w, (n,))
-    mask = torch.ones_like(x)
-    for i in range(n):
-        mask[i, :, max(0, cy[i] - ch) : cy[i] + ch, max(0, cx[i] - cw) : cx[i] + cw] = 0
-    return x * mask
+    cy = torch.randint(0, h, (n, 1, 1), device=x.device)
+    cx = torch.randint(0, w, (n, 1, 1), device=x.device)
+    ys = torch.arange(h, device=x.device).view(1, h, 1)
+    xs = torch.arange(w, device=x.device).view(1, 1, w)
+    keep = ((ys - cy).abs() >= ch) | ((xs - cx).abs() >= cw)
+    return x * keep.unsqueeze(1).to(x.dtype)
 
 
 def diff_augment(x):
@@ -207,17 +233,24 @@ class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.step = 0
-        self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+        sd = model.state_dict()
+        self.shadow = {k: v.detach().clone().float() for k, v in sd.items()}
+        self._float = [k for k, v in sd.items() if v.dtype.is_floating_point]
+        self._other = [k for k in sd if k not in set(self._float)]
 
     @torch.no_grad()
     def update(self, model):
         self.step += 1
         d = min(self.decay, (1 + self.step) / (10 + self.step))
-        for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point:
-                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1 - d)
-            else:
-                self.shadow[k] = v.detach().clone()
+        cur = model.state_dict()
+        # One fused call per operation instead of one per tensor. The model has
+        # dozens of parameter tensors and on this backend each launch costs more
+        # than the arithmetic it carries.
+        shadows = [self.shadow[k] for k in self._float]
+        torch._foreach_mul_(shadows, d)
+        torch._foreach_add_(shadows, [cur[k] for k in self._float], alpha=1 - d)
+        for k in self._other:
+            self.shadow[k] = cur[k].detach().clone()
 
     def state_dict(self):
         return {k: v.clone() for k, v in self.shadow.items()}
