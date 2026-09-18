@@ -1,0 +1,12 @@
+# torch 2.2.x is the last release with macOS x86_64 wheels, and it was built
+# against the NumPy 1.x ABI - NumPy 2 makes `import torch` fail outright.
+numpy<2
+torch>=2.2,<2.3; platform_system == "Darwin" and platform_machine == "x86_64"
+torch>=2.2; platform_system != "Darwin" or platform_machine != "x86_64"
+torchvision>=0.17
+Pillow>=10
+matplotlib>=3.7
+
+# mp4 output goes through ffmpeg, which imageio does not bundle
+imageio>=2.31
+imageio-ffmpeg>=0.4.9
