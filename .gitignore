@@ -1,1 +1,20 @@
+# Datasets and scraped glyphs
+dataset/
+out/
+
+# Training artefacts
+checkpoints/
+*.pt
+
+# Renders
+*.mp4
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+
+# macOS
 .DS_Store
+._*
