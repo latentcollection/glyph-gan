@@ -78,6 +78,26 @@ as the dataset grows — at `1024` the model has more parameters than it has
 pixels to fit, and the generator collapses to a fixed pattern that ignores its
 latent input entirely.
 
+## Performance
+
+Measured on a 2017 Intel MacBook Pro (Radeon Pro 560) via MPS, under sustained
+load with the CPU thermally throttled to 70% — so these are realistic numbers
+rather than cool-start ones. A cool machine runs roughly 40% faster for the
+first few minutes.
+
+| size | width | batch | s/step | 12k steps | 20k steps |
+|---|---|---|---|---|---|
+| 64 | 256 | 32 | 0.34 | 68 min | 113 min |
+| 64 | 256 | 64 | 0.49 | 97 min | 162 min |
+| 64 | 512 | 32 | 0.67 | 135 min | 224 min |
+| 128 | 256 | 32 | 0.57 | 113 min | 189 min |
+| 128 | 512 | 32 | 0.93 | 187 min | 311 min |
+
+Dataset size does not affect step time — a step costs one batch whatever the
+dataset holds, so growing it is free in wall-clock. Raising `batch_size` past 32
+is slower here, not faster: the GPU is already saturated and the larger batch
+just serialises.
+
 ## Output
 
 Training prints losses and writes checkpoints. `render_interpolation` writes an
