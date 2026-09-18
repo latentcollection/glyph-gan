@@ -51,3 +51,7 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The project is not installed into the environment (see [tool.uv] above), so
+# the repo root has to be importable for `import glyphgan` to resolve.
+pythonpath = ["."]
+markers = ["accelerator: exercises the GPU backend, not just CPU"]

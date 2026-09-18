@@ -115,7 +115,7 @@ count is `channels`. [GLOSSARY.md](GLOSSARY.md) has the rest.
 
 ```sh
 uv sync          # environment from uv.lock
-uv run pytest    # shapes, gradients, checkpoint roundtrip, accelerator
+uv run pytest    # 16 tests; -m "not accelerator" to skip the GPU-backend one
 uv run ruff check . && uv run ruff format .
 ```
 

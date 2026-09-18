@@ -18,4 +18,4 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
           pip install "numpy<2" Pillow pytest
       - name: Run checks
-        run: pytest -q tests/
+        run: pytest -q
