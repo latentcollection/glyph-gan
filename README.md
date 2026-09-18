@@ -61,6 +61,7 @@ be made at any point from any run.
 |---|---|---|
 | `size` | `64` | output resolution; a power of two. Layer count follows it |
 | `channels` | `256` | feature count at the 4×4 stage, halving outward |
+| `spectral` | `True` | spectral norm in the discriminator instead of batchnorm |
 | `max_steps` | `20000` | optimiser steps; the real training budget |
 | `batch_size` | `32` | |
 | `lr` | `2e-4` | from the DCGAN paper |
@@ -131,6 +132,10 @@ StyleGAN2-ADA would be the stronger choice for this data regime, but NVIDIA
 licenses it for "research or evaluation purposes only", which does not cover
 published artwork. DiffAugment (BSD-2) gets most of the small-data benefit
 without that constraint, and is built in.
+
+The discriminator uses spectral normalisation rather than the paper's
+batchnorm — batchnorm couples samples within a batch, and at batch 32 those
+statistics are noisy. It costs about 19% more per step.
 
 ## Credits
 

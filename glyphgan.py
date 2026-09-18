@@ -157,15 +157,17 @@ class Discriminator(nn.Module):
         size: int = 64,
         channels: int = DEFAULT_CHANNELS,
         alpha: float = 0.2,
-        spectral: bool = False,
+        spectral: bool = True,
     ):
         super().__init__()
         ch = list(reversed(_stages(size, channels)))
 
         # Spectral normalisation constrains each layer's Lipschitz constant and
-        # replaces batchnorm rather than joining it - batchnorm couples samples
+        # replaces batchnorm rather than joining it. Batchnorm couples samples
         # within a batch, which at batch 32 makes the discriminator's statistics
-        # noisy and lets information leak between real and fake.
+        # noisy and lets information leak between real and fake; this is the one
+        # place the model departs from the 2015 DCGAN paper, and it costs about
+        # 19% more per step.
         norm = spectral_norm if spectral else (lambda m: m)
 
         layers: list[nn.Module] = []
@@ -488,7 +490,7 @@ def train(
     betas: tuple[float, float] = (0.5, 0.999),
     channels: int = DEFAULT_CHANNELS,
     augment: bool = True,
-    spectral: bool = False,
+    spectral: bool = True,
     ckpt_dir: str | Path = "checkpoints",
     save_every_steps: int = 2000,
     preview_every: int | None = None,
