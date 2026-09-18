@@ -21,6 +21,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+# --- types and constants -------------------------------------------------------
+
 
 class HasStateDict(Protocol):
     """Anything whose weights can be written to a checkpoint.
@@ -34,9 +36,11 @@ class HasStateDict(Protocol):
 
 # A live generator, or a path to a checkpoint holding one.
 GeneratorSource = nn.Module | str | Path
+
 Measure = Callable[[torch.Tensor], torch.Tensor]
 
 LATENT = 200
+
 BASE = 4
 
 # Channels at the 4x4 stage, halving outward. 1024 (the width the original
@@ -53,12 +57,43 @@ DEFAULT_WIDTH = 256
 TARGET_SCALE = 0.9
 
 
+# --- helpers -------------------------------------------------------------------
+
+
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _ensure_parent(path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _resolve(generator: GeneratorSource, device: torch.device) -> nn.Module:
+    """A live module or a checkpoint path, either way ready to sample from."""
+    gen = generator if isinstance(generator, nn.Module) else load_generator(generator, device)
+    return gen.to(device).eval()
+
+
+def _write_video(frames: list[np.ndarray], out: str | Path, fps: int) -> Path:
+    import imageio.v2 as imageio
+
+    out = _ensure_parent(out)
+    try:
+        imageio.mimwrite(out, np.stack(frames), fps=fps)
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not write {out}. mp4 output needs the ffmpeg plugin: pip install imageio-ffmpeg"
+        ) from exc
+    return out
+
+
+# --- models --------------------------------------------------------------------
 
 
 def _stages(size: int, width: int = DEFAULT_WIDTH) -> list[int]:
@@ -114,6 +149,51 @@ class Discriminator(nn.Module):
         return self.output(self.net(x).reshape(-1, self.flat))
 
 
+class EMA:
+    """Exponential moving average of the generator's weights.
+
+    The raw generator chases the discriminator from step to step, so its
+    samples flicker. An averaged copy sits in the middle of that oscillation
+    and renders markedly cleaner - which matters more here than usual, because
+    the output is a video where frame-to-frame instability is visible directly.
+
+    `decay` ramps in over the first steps; at a fixed 0.999 the average would
+    still be mostly its initialisation thousands of steps in.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.step = 0
+        sd = model.state_dict()
+        self.shadow = {k: v.detach().clone().float() for k, v in sd.items()}
+        self._float = [k for k, v in sd.items() if v.dtype.is_floating_point]
+        self._other = [k for k in sd if k not in set(self._float)]
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.step += 1
+        d = min(self.decay, (1 + self.step) / (10 + self.step))
+        cur = model.state_dict()
+        # A fused torch._foreach_mul_/_add_ would collapse these launches, but
+        # MPS implements neither, so the per-tensor loop is the portable form.
+        for k in self._float:
+            self.shadow[k].mul_(d).add_(cur[k], alpha=1 - d)
+        for k in self._other:
+            self.shadow[k] = cur[k].detach().clone()
+
+    def state_dict(self) -> dict:
+        return {k: v.clone() for k, v in self.shadow.items()}
+
+    def to_generator(self, size: int, width: int, device: torch.device) -> Generator:
+        """A Generator carrying the averaged weights, ready to sample from."""
+        gen = Generator(size, width=width).to(device)
+        gen.load_state_dict(self.state_dict())
+        return gen.eval()
+
+
+# --- data ----------------------------------------------------------------------
+
+
 class _Cached(torch.utils.data.Dataset[tuple[torch.Tensor, int]]):
     """Decode the dataset once and keep it in memory.
 
@@ -157,18 +237,7 @@ def make_loader(
     )
 
 
-def _soft_labels(
-    shape: tuple, device: torch.device, flip_rate: float = 0.03, smooth: float = 0.1
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Smoothed targets with a few labels swapped, per ganhacks.
-
-    Both tricks slow the discriminator down so it cannot win outright early and
-    starve the generator of gradient.
-    """
-    real = torch.empty(shape, device=device).uniform_(1 - smooth, 1 + smooth)
-    fake = torch.empty(shape, device=device).uniform_(0.0, 2 * smooth)
-    flip = torch.rand(shape, device=device) < flip_rate
-    return torch.where(flip, fake, real), torch.where(flip, real, fake)
+# --- augmentation --------------------------------------------------------------
 
 
 def _brightness(x: torch.Tensor) -> torch.Tensor:
@@ -225,6 +294,117 @@ def diff_augment(x: torch.Tensor) -> torch.Tensor:
     return _cutout(_translate(_contrast(_brightness(x))))
 
 
+# --- checkpoints ---------------------------------------------------------------
+
+
+def save_checkpoint(
+    path: str | Path,
+    gen: nn.Module,
+    dis: nn.Module,
+    opt_g: torch.optim.Optimizer,
+    opt_d: torch.optim.Optimizer,
+    step: int,
+    size: int,
+    width: int = DEFAULT_WIDTH,
+    keep_last: int = 3,
+    ema: EMA | None = None,
+) -> Path:
+    path = _ensure_parent(path)
+    torch.save(
+        {
+            "gen": gen.state_dict(),
+            "dis": dis.state_dict(),
+            "opt_g": opt_g.state_dict(),
+            "opt_d": opt_d.state_dict(),
+            "step": step,
+            "size": size,
+            "width": width,
+            "latent": LATENT,
+            "ema": ema.state_dict() if ema is not None else None,
+        },
+        path,
+    )
+
+    # Rendering needs the generator alone, so keep a light copy next to the
+    # full checkpoints - roughly a fifth the size, and the only file worth
+    # keeping once a run is finished.
+    save_generator(path.parent / "generator.pt", ema if ema is not None else gen, size, width)
+
+    # Full checkpoints carry both models and both Adam states, so they run to
+    # a few hundred MB each. Keep only the most recent few.
+    if keep_last:
+        stale = sorted(path.parent.glob("step*.pt"), key=lambda p: p.stat().st_mtime)
+        for old in stale[:-keep_last]:
+            old.unlink()
+    return path
+
+
+def save_generator(
+    path: str | Path, gen: HasStateDict, size: int, width: int = DEFAULT_WIDTH
+) -> Path:
+    """`gen` may be a Generator or an EMA wrapper - both expose state_dict()."""
+    path = _ensure_parent(path)
+    torch.save({"gen": gen.state_dict(), "size": size, "width": width, "latent": LATENT}, path)
+    return path
+
+
+def load_generator(checkpoint: str | Path, device: torch.device | None = None) -> nn.Module:
+    device = device or pick_device()
+    blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
+    gen = Generator(
+        size=blob.get("size", 64),
+        latent=blob.get("latent", LATENT),
+        width=blob.get("width", DEFAULT_WIDTH),
+    )
+    gen.load_state_dict(blob["gen"])
+    return gen.to(device).eval()
+
+
+def latest_checkpoint(ckpt_dir: str | Path) -> Path | None:
+    found = sorted(Path(ckpt_dir).glob("step*.pt"), key=lambda p: p.stat().st_mtime)
+    return found[-1] if found else None
+
+
+def save_preview(
+    path: str | Path,
+    gen: nn.Module,
+    n: int = 8,
+    seed: int = 0,
+    device: torch.device | None = None,
+) -> Path:
+    """Contact sheet of `n` samples, for watching a run progress."""
+    from PIL import Image
+
+    device = device or pick_device()
+    g = torch.Generator().manual_seed(seed)
+    z = torch.randn(n, LATENT, generator=g).to(device)
+    was_training = gen.training
+    gen.eval()
+    with torch.no_grad():
+        sheet = np.hstack([to_image(v) for v in gen(z)])
+    gen.train(was_training)
+    path = _ensure_parent(path)
+    Image.fromarray(sheet).save(path)
+    return path
+
+
+# --- training ------------------------------------------------------------------
+
+
+def _soft_labels(
+    shape: tuple, device: torch.device, flip_rate: float = 0.03, smooth: float = 0.1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Smoothed targets with a few labels swapped, per ganhacks.
+
+    Both tricks slow the discriminator down so it cannot win outright early and
+    starve the generator of gradient.
+    """
+    real = torch.empty(shape, device=device).uniform_(1 - smooth, 1 + smooth)
+    fake = torch.empty(shape, device=device).uniform_(0.0, 2 * smooth)
+    flip = torch.rand(shape, device=device) < flip_rate
+    return torch.where(flip, fake, real), torch.where(flip, real, fake)
+
+
 def train_step(
     gen: nn.Module,
     dis: nn.Module,
@@ -257,205 +437,24 @@ def train_step(
     return loss_d.item(), loss_g.item()
 
 
-class EMA:
-    """Exponential moving average of the generator's weights.
-
-    The raw generator chases the discriminator from step to step, so its
-    samples flicker. An averaged copy sits in the middle of that oscillation
-    and renders markedly cleaner - which matters more here than usual, because
-    the output is a video where frame-to-frame instability is visible directly.
-
-    `decay` ramps in over the first steps; at a fixed 0.999 the average would
-    still be mostly its initialisation thousands of steps in.
-    """
-
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.step = 0
-        sd = model.state_dict()
-        self.shadow = {k: v.detach().clone().float() for k, v in sd.items()}
-        self._float = [k for k, v in sd.items() if v.dtype.is_floating_point]
-        self._other = [k for k in sd if k not in set(self._float)]
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        self.step += 1
-        d = min(self.decay, (1 + self.step) / (10 + self.step))
-        cur = model.state_dict()
-        # A fused torch._foreach_mul_/_add_ would collapse these launches, but
-        # MPS implements neither, so the per-tensor loop is the portable form.
-        for k in self._float:
-            self.shadow[k].mul_(d).add_(cur[k], alpha=1 - d)
-        for k in self._other:
-            self.shadow[k] = cur[k].detach().clone()
-
-    def state_dict(self) -> dict:
-        return {k: v.clone() for k, v in self.shadow.items()}
-
-
-def slerp(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
-    """Spherical interpolation between two latents.
-
-    A straight line between two Gaussian samples dips through norms the model
-    never saw in training, so linearly interpolated morphs sag and wash out
-    halfway. Travelling along the hypersphere keeps ||z|| roughly constant.
-    """
-    a_n = a / a.norm(dim=-1, keepdim=True)
-    b_n = b / b.norm(dim=-1, keepdim=True)
-    omega = torch.acos((a_n * b_n).sum(-1, keepdim=True).clamp(-1.0, 1.0))
-    sin_omega = torch.sin(omega)
-    if bool((sin_omega.abs() < 1e-6).all()):
-        return torch.lerp(a, b, t)
-    return (torch.sin((1.0 - t) * omega) / sin_omega) * a + (torch.sin(t * omega) / sin_omega) * b
-
-
-def to_image(x: torch.Tensor) -> np.ndarray:
-    """Single generator output to an 8-bit grayscale frame."""
-    x = x.detach().float().clamp(-TARGET_SCALE, TARGET_SCALE) / TARGET_SCALE
-    return ((x + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).squeeze().cpu().numpy()
-
-
-def load_generator(checkpoint: str | Path, device: torch.device | None = None) -> nn.Module:
-    device = device or pick_device()
-    blob = torch.load(Path(checkpoint), map_location=device, weights_only=False)
-    gen = Generator(
-        size=blob.get("size", 64),
-        latent=blob.get("latent", LATENT),
-        width=blob.get("width", DEFAULT_WIDTH),
-    )
-    gen.load_state_dict(blob["gen"])
-    return gen.to(device).eval()
-
-
-def render_interpolation(
-    generator, out, keys=8, frames=60, fps=30, loop=True, seed=None, device=None
-):
-    """Walk the latent space through `keys` waypoints and write a video.
-
-    `generator` may be a live module or a path to a checkpoint. Nothing here
-    depends on training state, so a video can be rendered from any checkpoint
-    at any time.
-    """
-    device = device or pick_device()
-    gen = generator if isinstance(generator, nn.Module) else load_generator(generator, device)
-    gen = gen.to(device).eval()
-
-    if isinstance(keys, int):
-        g = torch.Generator(device="cpu")
-        if seed is not None:
-            g.manual_seed(seed)
-        latent = gen.input.in_features
-        keys = [torch.randn(1, latent, generator=g).to(device) for _ in range(keys)]
-    if loop:
-        keys = list(keys) + [keys[0]]
-
-    try:
-        import imageio.v2 as imageio
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("imageio is required to render video") from exc
-
-    video = []
-    with torch.no_grad():
-        for a, b in zip(keys, keys[1:], strict=False):
-            for k in range(frames):
-                video.append(to_image(gen(slerp(a, b, k / frames))[0]))
-
-    out = Path(out)
-    try:
-        imageio.mimwrite(out, np.stack(video), fps=fps)
-    except Exception as exc:
-        raise RuntimeError(
-            f"could not write {out}. mp4 output needs the ffmpeg plugin: pip install imageio-ffmpeg"
-        ) from exc
-    return out
-
-
-def save_checkpoint(
-    path, gen, dis, opt_g, opt_d, epoch, size, width=DEFAULT_WIDTH, keep_last=3, ema=None
-):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "gen": gen.state_dict(),
-            "dis": dis.state_dict(),
-            "opt_g": opt_g.state_dict(),
-            "opt_d": opt_d.state_dict(),
-            "epoch": epoch,
-            "size": size,
-            "width": width,
-            "latent": LATENT,
-            "ema": ema.state_dict() if ema is not None else None,
-        },
-        path,
-    )
-
-    # Rendering needs the generator alone, so keep a light copy next to the
-    # full checkpoints - roughly a fifth the size, and the only file worth
-    # keeping once a run is finished.
-    save_generator(path.parent / "generator.pt", ema if ema is not None else gen, size, width)
-
-    # Full checkpoints carry both models and both Adam states, so they run to
-    # a few hundred MB each. Keep only the most recent few.
-    if keep_last:
-        stale = sorted(path.parent.glob("step*.pt"), key=lambda p: p.stat().st_mtime)
-        for old in stale[:-keep_last]:
-            old.unlink()
-    return path
-
-
-def save_generator(
-    path: str | Path, gen: HasStateDict, size: int, width: int = DEFAULT_WIDTH
-) -> Path:
-    """`gen` may be a Generator or an EMA wrapper - both expose state_dict()."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"gen": gen.state_dict(), "size": size, "width": width, "latent": LATENT}, path)
-    return path
-
-
-def latest_checkpoint(ckpt_dir: str | Path) -> Path | None:
-    found = sorted(Path(ckpt_dir).glob("step*.pt"), key=lambda p: p.stat().st_mtime)
-    return found[-1] if found else None
-
-
-def save_preview(path, gen, n=8, seed=0, device=None):
-    """Contact sheet of `n` samples, for watching a run progress."""
-    import numpy as np
-    from PIL import Image
-
-    device = device or pick_device()
-    g = torch.Generator().manual_seed(seed)
-    z = torch.randn(n, LATENT, generator=g).to(device)
-    was_training = gen.training
-    gen.eval()
-    with torch.no_grad():
-        sheet = np.hstack([to_image(v) for v in gen(z)])
-    gen.train(was_training)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(sheet).save(path)
-    return path
-
-
 def train(
-    img_dir,
-    size=64,
-    max_steps=20000,
-    epochs=None,
-    batch_size=32,
-    lr=2e-4,
-    betas=(0.5, 0.999),
-    width=DEFAULT_WIDTH,
-    augment=True,
-    ckpt_dir="checkpoints",
-    save_every_steps=2000,
-    preview_every=None,
-    resume=True,
-    device=None,
-    num_workers=None,
-    log_every=100,
-):
+    img_dir: str | Path,
+    size: int = 64,
+    max_steps: int = 20000,
+    epochs: int | None = None,
+    batch_size: int = 32,
+    lr: float = 2e-4,
+    betas: tuple[float, float] = (0.5, 0.999),
+    width: int = DEFAULT_WIDTH,
+    augment: bool = True,
+    ckpt_dir: str | Path = "checkpoints",
+    save_every_steps: int = 2000,
+    preview_every: int | None = None,
+    resume: bool = True,
+    device: torch.device | None = None,
+    num_workers: int | None = None,
+    log_every: int = 100,
+) -> tuple[nn.Module, nn.Module]:
     """Train for `max_steps` optimiser steps, checkpointing as it goes.
 
     The budget is in steps rather than epochs on purpose. A few hundred glyphs
@@ -486,12 +485,14 @@ def train(
             blob = torch.load(found, map_location=device, weights_only=False)
             gen.load_state_dict(blob["gen"])
             dis.load_state_dict(blob["dis"])
+            # Checkpoints written before the key was renamed store "epoch",
+            # though the value was always a step count.
+            start = blob.get("step", blob.get("epoch", 0))
             if blob.get("ema"):
                 ema.shadow = {k: v.to(device) for k, v in blob["ema"].items()}
-                ema.step = blob["epoch"]
+                ema.step = start
             opt_g.load_state_dict(blob["opt_g"])
             opt_d.load_state_dict(blob["opt_d"])
-            start = blob["epoch"]
             print(f"resumed {found.name} at step {start}")
 
     n = len(loader)
@@ -504,7 +505,14 @@ def train(
         f"{max_steps} steps"
     )
 
-    step, epoch = start, start // max(n, 1)
+    ckpt_dir = Path(ckpt_dir)
+
+    def checkpoint(step: int) -> Path:
+        return save_checkpoint(
+            ckpt_dir / f"step{step:07d}.pt", gen, dis, opt_g, opt_d, step, size, width, ema=ema
+        )
+
+    step = start
     try:
         while step < max_steps:
             for x, _ in loader:
@@ -515,41 +523,118 @@ def train(
                     print(f"step {step:6d}/{max_steps}  loss_d {loss_d:.3f}  loss_g {loss_g:.3f}")
                 if preview_every and step % preview_every == 0:
                     # Preview the averaged weights, since that is what renders.
-                    shadow = Generator(size, width=width).to(device)
-                    shadow.load_state_dict(ema.state_dict())
-                    save_preview(Path(ckpt_dir) / f"preview{step:07d}.png", shadow, device=device)
-                if save_every_steps and step % save_every_steps == 0:
-                    save_checkpoint(
-                        Path(ckpt_dir) / f"step{step:07d}.pt",
-                        gen,
-                        dis,
-                        opt_g,
-                        opt_d,
-                        step,
-                        size,
-                        width,
-                        ema=ema,
+                    save_preview(
+                        ckpt_dir / f"preview{step:07d}.png",
+                        ema.to_generator(size, width, device),
+                        device=device,
                     )
+                if save_every_steps and step % save_every_steps == 0:
+                    checkpoint(step)
                 if step >= max_steps:
                     break
-            epoch += 1
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
-        path = save_checkpoint(
-            Path(ckpt_dir) / f"step{step:07d}.pt",
-            gen,
-            dis,
-            opt_g,
-            opt_d,
-            step,
-            size,
-            width,
-            ema=ema,
-        )
-        print(f"saved {path} at step {step}")
+        print(f"saved {checkpoint(step)} at step {step}")
 
     return gen, dis
+
+
+# --- rendering -----------------------------------------------------------------
+
+
+def slerp(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
+    """Spherical interpolation between two latents.
+
+    A straight line between two Gaussian samples dips through norms the model
+    never saw in training, so linearly interpolated morphs sag and wash out
+    halfway. Travelling along the hypersphere keeps ||z|| roughly constant.
+    """
+    a_n = a / a.norm(dim=-1, keepdim=True)
+    b_n = b / b.norm(dim=-1, keepdim=True)
+    omega = torch.acos((a_n * b_n).sum(-1, keepdim=True).clamp(-1.0, 1.0))
+    sin_omega = torch.sin(omega)
+    if bool((sin_omega.abs() < 1e-6).all()):
+        return torch.lerp(a, b, t)
+    return (torch.sin((1.0 - t) * omega) / sin_omega) * a + (torch.sin(t * omega) / sin_omega) * b
+
+
+def to_image(x: torch.Tensor) -> np.ndarray:
+    """Single generator output to an 8-bit greyscale frame."""
+    x = x.detach().float().clamp(-TARGET_SCALE, TARGET_SCALE) / TARGET_SCALE
+    return ((x + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).squeeze().cpu().numpy()
+
+
+def render_interpolation(
+    generator: GeneratorSource,
+    out: str | Path,
+    keys: int | list[torch.Tensor] = 8,
+    frames: int = 60,
+    fps: int = 30,
+    loop: bool = True,
+    seed: int | None = None,
+    device: torch.device | None = None,
+) -> Path:
+    """Walk the latent space through `keys` waypoints and write a video.
+
+    `generator` may be a live module or a path to a checkpoint. Nothing here
+    depends on training state, so a video can be rendered from any checkpoint
+    at any time.
+    """
+    device = device or pick_device()
+    gen = _resolve(generator, device)
+
+    if isinstance(keys, int):
+        g = torch.Generator(device="cpu")
+        if seed is not None:
+            g.manual_seed(seed)
+        latent = gen.input.in_features
+        keys = [torch.randn(1, latent, generator=g).to(device) for _ in range(keys)]
+    if loop:
+        keys = list(keys) + [keys[0]]
+
+    video = []
+    with torch.no_grad():
+        for a, b in zip(keys, keys[1:], strict=False):
+            video += [to_image(gen(slerp(a, b, k / frames))[0]) for k in range(frames)]
+    return _write_video(video, out, fps)
+
+
+def render_axis(
+    gen: GeneratorSource,
+    direction: torch.Tensor,
+    out: str | Path,
+    span: float = 3.0,
+    frames: int = 60,
+    fps: int = 30,
+    seed: int = 0,
+    device: torch.device | None = None,
+    base: torch.Tensor | None = None,
+) -> Path:
+    """Walk a single latent direction from -span to +span and write a video.
+
+    Everything except the chosen axis is held fixed, so the result reads as one
+    typeface being pushed along that axis rather than as a dissolve between two
+    unrelated letterforms.
+    """
+    device = device or pick_device()
+    gen = _resolve(gen, device)
+    if base is None:
+        g = torch.Generator().manual_seed(seed)
+        base = torch.randn(1, LATENT, generator=g)
+    base = base.to(device)
+    d = direction.to(device).unsqueeze(0)
+
+    video = []
+    with torch.no_grad():
+        for i in range(frames):
+            t = -span + 2 * span * i / (frames - 1)
+            video.append(to_image(gen(base + t * d)[0]))
+    video += video[::-1]  # walk out and back so it loops
+    return _write_video(video, out, fps)
+
+
+# --- latent directions ---------------------------------------------------------
 
 
 def _extent(mask: torch.Tensor) -> torch.Tensor:
@@ -619,31 +704,3 @@ def find_direction(
         ((pred - pred.mean()) * (held - held.mean())).mean() / (pred.std() * held.std() + 1e-12)
     )
     return d.float(), corr
-
-
-def render_axis(gen, direction, out, span=3.0, frames=60, fps=30, seed=0, device=None, base=None):
-    """Walk a single latent direction from -span to +span and write a video.
-
-    Everything except the chosen axis is held fixed, so the result reads as one
-    typeface being pushed along that axis rather than as a dissolve between two
-    unrelated letterforms.
-    """
-    import imageio.v2 as imageio
-
-    device = device or pick_device()
-    gen = gen.to(device).eval()
-    if base is None:
-        g = torch.Generator().manual_seed(seed)
-        base = torch.randn(1, LATENT, generator=g)
-    base = base.to(device)
-    d = direction.to(device).unsqueeze(0)
-
-    video = []
-    with torch.no_grad():
-        for i in range(frames):
-            t = -span + 2 * span * i / (frames - 1)
-            video.append(to_image(gen(base + t * d)[0]))
-    video = video + video[::-1]  # walk out and back so it loops
-    out = Path(out)
-    imageio.mimwrite(out, np.stack(video), fps=fps)
-    return out
